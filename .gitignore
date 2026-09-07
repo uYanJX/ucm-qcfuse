@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+/cache/
+/logs/
+/models/
+*.bin
+*.pt
+*.safetensors
+*.jsonl
+results.csv
