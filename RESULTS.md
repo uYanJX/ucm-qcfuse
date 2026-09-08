@@ -15,9 +15,9 @@ Across the four completed paired runs, aggregate throughput was 0.594 samples/s
 for full computation and 0.526 samples/s for QCFuse, so this host did not show
 an overall speedup. RULER multi-query did improve: TTFT was 1.41x faster and
 throughput 1.32x higher. The other workloads were neutral or slower because two
-online passes and SSD reads outweighed the saved attention work. The cache
-volume was on SATA-class storage measured at about 525 MB/s sequential read;
-NVMe is recommended for performance evaluation.
+online passes and SSD reads outweighed the saved attention work.
+
+**The storage device used for this test achieved only 126 MB/s (approximately 0.126 GB/s) for direct sequential reads.**
 
 Quality remained close at this smoke-test scale: two F1 datasets changed by
 less than 0.018, Musique improved by 0.050, and RULER was unchanged. Thirty
