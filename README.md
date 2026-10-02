@@ -1,7 +1,7 @@
 # UCM QCFuse
 
 This repository is a focused port of [QCFuse](https://github.com/uYanJX/QCFuse)
-to Unified Cache Management (UCM). It contains only the QCFuse implementation,
+to Huawei's [Unified Cache Management (UCM)](https://github.com/uYanJX/ucm-qcfuse). It contains only the QCFuse implementation,
 the required UCM/vLLM integration patch, targeted tests, and a benchmark runner.
 Model weights, datasets, generated caches, and raw logs are intentionally
 excluded.
@@ -16,6 +16,11 @@ The implementation uses raw pre-RoPE Q/K/V, mean importance aggregation,
 position-aware ragged attention, bounded SSD/H2D layer prefetch, and per-request
 state. Homogeneous online batches are supported and have been smoke-tested with
 batch sizes 2 and 4. Offline `KVCOMPUTE` remains serial by design.
+
+## 🔥 News
+
+- **2026.10.02** 🚀 QCFuse is compatible with Huawei's [Unified Cache Management (UCM)](https://github.com/uYanJX/ucm-qcfuse) framework and supports multi-batch inference.
+- **2026.10.02** 🚀 Qwen3-32B reasoning evaluation on HotpotQA and 2WikiMQA keeps selected configurations within 1% relative ROUGE-L of full computation; see [NEWS.md](NEWS.md).
 
 ## Compatibility
 
