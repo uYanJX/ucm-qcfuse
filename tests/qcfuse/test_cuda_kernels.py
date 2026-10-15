@@ -637,3 +637,28 @@ def test_gpu_resident_lazy_load_keeps_source_bytes_immutable(tmp_path, batch):
         store.close()
         transfer.release_transfer_pools("")
         transfer.release_resident_files()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_bounded_worker_profile_keeps_cuda_outputs_and_removes_decode_hook(
+    tmp_path, batch
+):
+    import json
+    from types import SimpleNamespace
+    from ucm.integration.vllm.qcfuse_worker import QcFuseWorkerExtension
+
+    torch.manual_seed(91 + batch)
+    model = torch.nn.Linear(64, 32, bias=False).cuda().to(torch.bfloat16)
+    value = torch.randn(batch * 7, 64, device="cuda", dtype=torch.bfloat16)
+    expected = model(value)
+    worker = QcFuseWorkerExtension()
+    worker.model_runner = SimpleNamespace(model=model)
+    path = tmp_path / "execution.json"
+    worker.qcfuse_start_execution_profile(str(path), max_forwards=2)
+    for _ in range(4):
+        torch.testing.assert_close(model(value), expected, rtol=0, atol=0)
+    row = worker.qcfuse_stop_execution_profile()
+    assert row["trace_written"] and row["forward_calls"] == 2
+    assert not model._forward_pre_hooks
+    trace = json.loads(path.read_text())
+    assert any(event.get("cat") == "kernel" for event in trace["traceEvents"])

@@ -38,6 +38,122 @@ class QcFuseWorkerExtension:
                 self._qcfuse_forward_observer_handle = None
         return result
 
+    def qcfuse_memory_breakdown(self):
+        """Attribute live model and native KV storage without copying tensors."""
+        import torch
+        from ucm.store.qcfuse.transfer import benchmark_snapshot
+
+        model = self.model_runner.model
+        parameters = {
+            tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+            for tensor in model.parameters()
+            if tensor.numel()
+        }
+        cache_storages = {}
+        cache_layers = []
+        for name, module in model.named_modules():
+            cache = getattr(module, "kv_cache", None)
+            values = cache if isinstance(cache, (tuple, list)) else (cache,)
+            for tensor in values:
+                if not isinstance(tensor, torch.Tensor) or not tensor.numel():
+                    continue
+                storage = tensor.untyped_storage()
+                cache_storages[storage.data_ptr()] = storage.nbytes()
+                cache_layers.append(
+                    {
+                        "module": name,
+                        "shape": list(tensor.shape),
+                        "dtype": str(tensor.dtype),
+                        "view_bytes": tensor.numel() * tensor.element_size(),
+                    }
+                )
+        return {
+            **benchmark_snapshot(self),
+            "model_parameter_storage_bytes": sum(parameters.values()),
+            "native_kv_storage_bytes": (
+                sum(cache_storages.values()) if cache_layers else None
+            ),
+            "native_kv_layers": cache_layers,
+            "memory_scope": (
+                "unique_parameter_and_observed_layer_kv_storage;"
+                "allocator_reserved_bytes_are_not_additional_live_tensors"
+            ),
+        }
+
+    def qcfuse_start_execution_profile(self, path, max_forwards=3):
+        """Profile a bounded eager prefix through a named, serializable RPC.
+
+        The next model forward stops the profiler and removes the observer.
+        Call qcfuse_stop_execution_profile in a finally block as well, since
+        generation may finish before reaching that boundary. Detailed profiles
+        are diagnostic and must never supply the formal latency measurement.
+        """
+        import os
+        import torch
+
+        if isinstance(max_forwards, bool) or not isinstance(max_forwards, int):
+            raise ValueError("max_forwards must be a positive integer")
+        if max_forwards < 1:
+            raise ValueError("max_forwards must be a positive integer")
+        previous = getattr(self, "_qcfuse_execution_profile", None)
+        if previous is not None and previous["profiler"] is not None:
+            raise RuntimeError("An execution profile is already active")
+        path = os.fspath(path).replace("{rank}", str(getattr(self, "rank", 0)))
+        if os.path.exists(path):
+            raise FileExistsError(path)
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        profiler = torch.profiler.profile(activities=activities, record_shapes=True)
+        state = {
+            "path": path,
+            "max_forwards": max_forwards,
+            "forward_calls": 0,
+            "profiler": profiler,
+            "hook": None,
+            "trace_written": False,
+        }
+        profiler.start()
+        self._qcfuse_execution_profile = state
+
+        def before_forward(_model, _args):
+            if state["forward_calls"] == max_forwards:
+                self.qcfuse_stop_execution_profile()
+            else:
+                state["forward_calls"] += 1
+
+        try:
+            state["hook"] = self.model_runner.model.register_forward_pre_hook(
+                before_forward
+            )
+        except BaseException:
+            state["profiler"] = None
+            profiler.stop()
+            raise
+        return {"path": path, "max_forwards": max_forwards, "active": True}
+
+    def qcfuse_stop_execution_profile(self):
+        """Stop and export once; leave no profiler callback on later decode."""
+        state = getattr(self, "_qcfuse_execution_profile", None)
+        if state is None:
+            return {"active": False, "trace_written": False, "forward_calls": 0}
+        hook = state["hook"]
+        state["hook"] = None
+        if hook is not None:
+            hook.remove()
+        profiler = state["profiler"]
+        state["profiler"] = None
+        if profiler is not None:
+            profiler.stop()
+            profiler.export_chrome_trace(state["path"])
+            state["trace_written"] = True
+        return {
+            "active": False,
+            "path": state["path"],
+            "forward_calls": state["forward_calls"],
+            "trace_written": state["trace_written"],
+        }
+
     def qcfuse_start_forward_observer(self):
         """Observe actual eager model input sizes in explicitly audited runs."""
         previous = getattr(self, "_qcfuse_forward_observer_handle", None)

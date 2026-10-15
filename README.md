@@ -82,7 +82,31 @@ variants are not reported as CacheBlend or ProphetKV.
 | `ucm/store/qcfuse/` | Packed cache format, CPU/GPU residency and bounded SSD/H2D prefetch |
 | `ucm/integration/vllm/latest_sparse.py` | Native vLLM 0.31 Qwen3 hooks |
 | `ucm/integration/vllm/qcfuse_connector.py` | Scheduler/worker request metadata |
-| `ucm/integration/vllm/qcfuse_worker.py` | Residency control and measurement snapshots |
+| `ucm/integration/vllm/qcfuse_worker.py` | Residency control, memory attribution and bounded profiling |
+
+For diagnostics, the configured worker extension exposes named RPCs that work
+with the current vLLM serializer:
+
+```python
+memory = llm.collective_rpc("qcfuse_memory_breakdown")
+llm.collective_rpc(
+    "qcfuse_start_execution_profile",
+    args=("/path/to/new-trace.json", 3),
+)
+try:
+    # Submit the fixed diagnostic requests through the normal generation path.
+    ...
+finally:
+    profile = llm.collective_rpc("qcfuse_stop_execution_profile")
+```
+
+Use a trace path containing `{rank}` when running more than one rank. The
+profiler records tensor shapes and stops before the forward following its
+budget; the final RPC also handles requests that end earlier. It removes its
+model callback before later decode. Detailed profiles include instrumentation
+overhead and must be disabled for formal timing. Memory attribution counts
+unique parameter and observed native KV storage; allocator reservations must
+not be added again as live tensor memory.
 | `benchmarks/qcfuse/` | Dataset preparation, measured runs, queue and result validation |
 | `tests/qcfuse/` | CPU, CUDA, lifecycle and benchmark-contract tests |
 | `ucm/`, `kv_semantics/`, `test/` | UCM Python/native source and upstream tests |
