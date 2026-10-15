@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from collections import deque
@@ -66,6 +67,22 @@ class QcFuse(UcmSparseBase):
         self._qcompute_reuse_hits = 0
         self._qcompute_reuse_misses = 0
         self._completed_token_work = deque(maxlen=256)
+        self._attention_backend = os.environ.get(
+            "QCFUSE_GPU_ATTENTION_BACKEND", "native"
+        )
+        if self._attention_backend not in ("native", "flex"):
+            raise ValueError("QCFUSE_GPU_ATTENTION_BACKEND must be native or flex")
+        self._flex_key_block = int(os.environ.get("QCFUSE_FLEX_KEY_BLOCK", "64"))
+        if self._attention_backend == "flex" and self._flex_key_block not in (64, 128):
+            raise ValueError("QCFUSE_FLEX_KEY_BLOCK must be 64 or 128")
+        self._attention_backend_counts = {"native": 0, "flex": 0}
+
+    def attention_backend_stats(self):
+        return {
+            "configured": self._attention_backend,
+            "flex_key_block": self._flex_key_block,
+            "layer_calls": dict(self._attention_backend_counts),
+        }
 
     def take_token_work(self):
         """Drain bounded observations through the benchmark control RPC."""
@@ -457,11 +474,39 @@ class QcFuse(UcmSparseBase):
         if output is None or output.shape != query.shape:
             raise RuntimeError("QCFuse requires vLLM attention's shaped output buffer")
         device = query.device
-        q_lens = torch.tensor(prepared.q_lens, dtype=torch.int32, device=device)
-        kv_lens = torch.tensor(prepared.kv_lens, dtype=torch.int32, device=device)
         impl = layer.impl
         window = getattr(impl, "sliding_window", (-1, -1))
         sliding_window = -1 if not window or window[0] < 0 else int(window[0]) + 1
+        scale = float(getattr(impl, "scale", query.shape[-1] ** -0.5))
+        logit_cap = float(getattr(impl, "logits_soft_cap", 0.0))
+        if (
+            getattr(self, "_attention_backend", "native") == "flex"
+            and self._step.phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH)
+            and query.device.type == "cuda"
+            and query.dtype in (torch.bfloat16, torch.float16)
+            and query.shape[-1] == 128
+            and sliding_window == -1
+            and logit_cap == 0.0
+        ):
+            from ucm.sparse.qcfuse.flex_attention import flex_positions_attention_fwd
+
+            flex_positions_attention_fwd(
+                query,
+                key,
+                value,
+                output,
+                [entry.state for entry in self._step.entries],
+                prepared.q_lens,
+                prepared.kv_lens,
+                scale,
+                self._flex_key_block,
+            )
+            self._attention_backend_counts["flex"] += 1
+            return
+        if hasattr(self, "_attention_backend_counts"):
+            self._attention_backend_counts["native"] += 1
+        q_lens = torch.tensor(prepared.q_lens, dtype=torch.int32, device=device)
+        kv_lens = torch.tensor(prepared.kv_lens, dtype=torch.int32, device=device)
         ragged_positions_attention_fwd(
             query,
             key,
@@ -474,8 +519,8 @@ class QcFuse(UcmSparseBase):
             prepared.q_positions,
             max(prepared.q_lens),
             is_causal=True,
-            sm_scale=float(getattr(impl, "scale", query.shape[-1] ** -0.5)),
-            logit_cap=float(getattr(impl, "logits_soft_cap", 0.0)),
+            sm_scale=scale,
+            logit_cap=logit_cap,
             sliding_window_size=sliding_window,
         )
 

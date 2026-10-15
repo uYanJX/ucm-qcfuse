@@ -185,6 +185,9 @@ def test_snapshot_discards_warmup_counts_and_drains_only_measured_requests(monke
     from ucm.sparse.qcfuse.qcfuse import QcFuse
 
     sparse = object.__new__(QcFuse)
+    sparse._attention_backend = "native"
+    sparse._flex_key_block = 64
+    sparse._attention_backend_counts = {"native": 0, "flex": 0}
     sparse._completed_token_work = deque([{"client_request_id": "warmup"}], maxlen=256)
     worker = QcFuseWorkerExtension()
     monkeypatch.setattr(transfer, "benchmark_snapshot", lambda *args: {})

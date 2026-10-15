@@ -11,6 +11,96 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("key_block", [64, 128])
+def test_flex_attention_cuda_preserves_masks_and_repeated_request_ownership(
+    batch_size, key_block
+):
+    from types import SimpleNamespace
+    from ucm.sparse.qcfuse.blend_info import BlendStyle, QcFuseRequestState
+    from ucm.sparse.qcfuse.qcfuse import QcFuse
+    from ucm.sparse.qcfuse.flex_attention import flex_positions_attention_fwd
+
+    torch.manual_seed(300 + batch_size)
+    q_lens = [97, 139, 155, 211][:batch_size]
+    kv_lens = [193, 277, 311, 419][:batch_size]
+    query = torch.randn(sum(q_lens) * 2, 8, 128, device="cuda", dtype=torch.bfloat16)[
+        ::2
+    ]
+    key = torch.randn(sum(kv_lens) * 2, 2, 128, device="cuda", dtype=torch.bfloat16)[
+        ::2
+    ]
+    value = torch.randn_like(key)
+    originals = [item.clone() for item in (query, key, value)]
+    output = torch.empty_like(query)
+    states = [
+        QcFuseRequestState(positions=torch.randint(kv_len, (q_len,), device="cuda"))
+        for q_len, kv_len in zip(q_lens, kv_lens)
+    ]
+    for reuse in range(2):
+        if reuse:
+            states = [
+                QcFuseRequestState(positions=state.positions.flip(0))
+                for state in states
+            ]
+        fuser = object.__new__(QcFuse)
+        fuser._attention_backend = "flex"
+        fuser._flex_key_block = key_block
+        fuser._attention_backend_counts = {"native": 0, "flex": 0}
+        fuser._step = SimpleNamespace(
+            phase=BlendStyle.DO_BLEND,
+            entries=[SimpleNamespace(state=state) for state in states],
+        )
+        prepared = SimpleNamespace(
+            q_lens=q_lens,
+            kv_lens=kv_lens,
+            q_positions=torch.cat([state.positions for state in states]).to(
+                torch.int32
+            ),
+        )
+        layer = SimpleNamespace(impl=SimpleNamespace(sliding_window=(-1, -1)))
+        fuser._run_sparse_attention(query, key, value, output, layer, prepared)
+        assert fuser.attention_backend_stats()["layer_calls"] == {
+            "native": 0,
+            "flex": 1,
+        }
+        plans = [state.attn_meta["flex_position_plan"] for state in states]
+        first = output.clone()
+        flex_positions_attention_fwd(
+            query, key, value, output, states, q_lens, kv_lens, 128**-0.5, key_block
+        )
+        assert torch.equal(first, output)
+        assert all(
+            state.attn_meta["flex_position_plan"] is plan
+            for state, plan in zip(states, plans)
+        )
+        qo = ko = 0
+        for state, q_len, kv_len in zip(states, q_lens, kv_lens):
+            q = query[qo : qo + q_len].float().transpose(0, 1)
+            k = key[ko : ko + kv_len].float().transpose(0, 1).repeat_interleave(4, 0)
+            v = value[ko : ko + kv_len].float().transpose(0, 1).repeat_interleave(4, 0)
+            logits = (q @ k.transpose(-1, -2)) * (128**-0.5)
+            mask = torch.arange(kv_len, device="cuda")[None] <= state.positions[:, None]
+            expected = (
+                logits.masked_fill(~mask[None], -float("inf")).softmax(-1) @ v
+            ).transpose(0, 1)
+            torch.testing.assert_close(
+                output[qo : qo + q_len].float(), expected, atol=0.015625, rtol=0.03
+            )
+            qo += q_len
+            ko += kv_len
+        assert all(
+            torch.equal(old, current)
+            for old, current in zip(originals, (query, key, value))
+        )
+        fuser._step.phase = BlendStyle.QCOMPUTE
+        fuser._run_sparse_attention(query, key, value, output, layer, prepared)
+        assert fuser.attention_backend_stats()["layer_calls"] == {
+            "native": 1,
+            "flex": 1,
+        }
+
+
 @pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize("ratio", [0.4, 0.5])
 def test_selection_workspace_keeps_native_rope_and_selected_indices_bit_exact(

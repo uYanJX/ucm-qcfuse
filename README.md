@@ -148,6 +148,24 @@ shapes change, so verify selection, token outputs and quality against the
 whole-matrix configuration on the same inputs before adopting it. Frozen-run
 receipts record the configured tile budget separately.
 
+## Position-based attention experiment
+
+`QCFUSE_GPU_ATTENTION_BACKEND=flex` enables a compiled FlexAttention backend
+only for the DO_BLEND prefill pass. The default is `native`. It preserves
+original query positions, full cached KV lengths and `key_position <=
+query_position`, including unequal request lengths. It builds compact block
+metadata once per request and reuses the mask across layers; masks and source
+positions are request-owned. QCOMPUTE selection, offline cache generation and
+decode keep their existing kernels. Unsupported head dimensions, sliding
+windows and logit caps keep native attention.
+
+This opt-in requires the current tested PyTorch FlexAttention API. BF16
+arithmetic differs from the reference kernel, so kernel tolerances alone do
+not prove model quality. Complete matched output/quality regressions before
+adopting it. `QCFUSE_FLEX_KEY_BLOCK=64` (default) or `128` controls key tiling.
+Worker benchmark snapshots report actual native/flex layer-call counts;
+frozen receipts record the backend and block size.
+
 ## Native decode graph experiment
 
 The frozen runner accepts `--decode-cudagraph on` (default: `off`). It uses

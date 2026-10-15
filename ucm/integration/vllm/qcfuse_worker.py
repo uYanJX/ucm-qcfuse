@@ -19,6 +19,9 @@ class QcFuseWorkerExtension:
 
         if has_ucm_sparse():
             sparse = get_ucm_sparse()
+            attention_stats = getattr(sparse, "attention_backend_stats", None)
+            if callable(attention_stats):
+                result["attention_backend"] = attention_stats()
             take_token_work = getattr(sparse, "take_token_work", None)
             if callable(take_token_work):
                 rows = take_token_work()
