@@ -92,6 +92,35 @@ def _compute_budget(length: int, ratio: float) -> int:
     return min(length, max(1, int(length * ratio)))
 
 
+def _assemble_selection_keys(prefix_layers, query_layers):
+    """Own the original stacked concatenation without an extra full K stack."""
+    if not prefix_layers or len(prefix_layers) != len(query_layers):
+        raise ValueError("Selection requires matching critical-layer key lists")
+    prefix = prefix_layers[0]
+    query = query_layers[0]
+    tensors = [*prefix_layers, *query_layers]
+    if any(t.device != prefix.device for t in tensors):
+        raise ValueError("Selection keys must be on the same device")
+    if (
+        any(t.shape != prefix.shape for t in prefix_layers)
+        or any(t.shape != query.shape for t in query_layers)
+        or prefix.shape[1:] != query.shape[1:]
+    ):
+        raise ValueError("Selection keys have incompatible layer shapes")
+    dtype = prefix.dtype
+    for tensor in tensors:
+        dtype = torch.promote_types(dtype, tensor.dtype)
+    result = torch.empty(
+        (len(prefix_layers), prefix.shape[0] + query.shape[0], *prefix.shape[1:]),
+        device=prefix.device,
+        dtype=dtype,
+    )
+    for layer, (prefix, query) in enumerate(zip(prefix_layers, query_layers)):
+        result[layer, : prefix.shape[0]].copy_(prefix)
+        result[layer, prefix.shape[0] :].copy_(query)
+    return result
+
+
 class IndiceSelector:
     @staticmethod
     def select(
@@ -174,7 +203,6 @@ class IndiceSelector:
         final_indices_list: List[torch.Tensor] = []
         req_lens_list: List[int] = []
 
-        old_k_stacked = torch.stack(old_k, dim=0)
         old_q_stacked = torch.stack(old_q, dim=0)
         if not old_q_stacked.is_cuda:
             raise RuntimeError("ATTN selection requires CUDA.")
@@ -183,7 +211,6 @@ class IndiceSelector:
             query_k_layers = info.get_query_k_layers(layer_ids)
         else:
             query_k_layers = info.get_all_query_k(info.attn_start, info.attn_end)
-        query_k_stacked = torch.stack(query_k_layers, dim=0)
 
         q_lens = info.q_lens
         q_offsets = info.q_offsets
@@ -209,9 +236,13 @@ class IndiceSelector:
                 q_chunk = old_q_stacked[:, q_loc : q_loc + q_len].reshape(
                     num_layers, q_len, params.num_heads, params.head_dim
                 )
-                prefix_k = old_k_stacked[:, r.req_start : r.quest_start]
-                query_k = query_k_stacked[:, query_k_loc : query_k_loc + query_k_len]
-                k_full = torch.cat([prefix_k, query_k], dim=1).reshape(
+                k_full = _assemble_selection_keys(
+                    [key[r.req_start : r.quest_start] for key in old_k],
+                    [
+                        key[query_k_loc : query_k_loc + query_k_len]
+                        for key in query_k_layers
+                    ],
+                ).reshape(
                     num_layers,
                     prefix_len + query_k_len,
                     params.num_kv_heads,
@@ -276,19 +307,22 @@ class IndiceSelector:
         *,
         is_query: bool,
     ) -> torch.Tensor:
-        pos = token_positions.repeat(num_layers)
         # vLLM's rotary_emb (``ops.rotary_embedding``) expects 3D
         # ``[tokens, heads, head_dim]``; SGLang's original passed the flattened
         # 2D ``[tokens, heads*head_dim]`` layout, so reshape here first.
-        three_d = tensor.reshape(-1, num_heads, head_dim).contiguous()
+        layers = tensor.reshape(num_layers, -1, num_heads, head_dim).contiguous()
         # SGLang's rotary implementation accepts aliased Q/K inputs, while
         # vLLM's CUDA op updates both tensors in place.  Keep the unused input
         # separate so the tensor being scored is rotated exactly once.
-        scratch = torch.empty_like(three_d)
-        if is_query:
-            q_rot, _ = rotary_emb(pos, three_d, scratch)
-            rotated = q_rot
-        else:
-            _, k_rot = rotary_emb(pos, scratch, three_d)
-            rotated = k_rot
-        return rotated.reshape(num_layers, -1, num_heads, head_dim)
+        # The native RoPE operation is independent for each token/head. Rotate
+        # the same owned stack one layer at a time with one-layer scratch;
+        # selection still scores all critical layers together in the old order.
+        scratch = torch.empty_like(layers[0])
+        for layer in layers.unbind(0):
+            if is_query:
+                rotated, _ = rotary_emb(token_positions, layer, scratch)
+            else:
+                _, rotated = rotary_emb(token_positions, scratch, layer)
+            if rotated.data_ptr() != layer.data_ptr():
+                layer.copy_(rotated)
+        return layers

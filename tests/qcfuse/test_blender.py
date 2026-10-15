@@ -173,6 +173,7 @@ def test_blend_adopts_owned_loads_then_releases_only_selection_kv(
 
         def select(info, *, old_k, old_q, positions):
             assert old_k == [owned[1][0], owned[2][0]]
+            assert info.v_buffer[1] is None and info.v_buffer[2] is None
             return indices, torch.tensor([2])
 
         monkeypatch.setattr(blender.indice_select.IndiceSelector, "select", select)

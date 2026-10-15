@@ -12,6 +12,109 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("ratio", [0.4, 0.5])
+def test_selection_workspace_keeps_native_rope_and_selected_indices_bit_exact(
+    batch, ratio, monkeypatch
+):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from ucm.sparse.qcfuse.blend_info import AttParams, QcFuseRequestState
+    from ucm.sparse.qcfuse import indice_select
+
+    with set_current_vllm_config(VllmConfig()):
+        rotary = get_rope(head_size=128, max_position=2048, dtype=torch.bfloat16).cuda()
+    chunks, lengths, query_lengths = [0], [], []
+    positions = []
+    for index in range(batch):
+        document, query = 257 + index * 31, 17 + index
+        total = 8 + document + query
+        start = chunks[-1]
+        chunks.extend([start + 8, start + 8 + document, start + total])
+        positions.append(torch.arange(total, device="cuda"))
+        lengths.append(total)
+        query_lengths.append(query)
+    keys = [
+        torch.randn(sum(lengths), 1024, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    queries = [
+        torch.randn(sum(query_lengths), 8192, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    query_keys = [
+        torch.randn(sum(query_lengths), 1024, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    originals = [value.clone() for value in keys + queries + query_keys]
+    state = QcFuseRequestState(
+        ratio=ratio,
+        att_params=AttParams(64, 8, 128, 3),
+        chunk_loc_list=torch.tensor(chunks, device="cuda"),
+        req_len_list=torch.tensor([3] * batch, device="cuda"),
+        critical_layers=[0, 1, 2],
+        query_k_buffer=query_keys,
+        q_lens=query_lengths,
+        q_offsets=[0] * batch,
+        query_k_lens=query_lengths,
+        rotary_emb=rotary,
+    )
+    positions = torch.cat(positions)
+    actual, actual_lengths = indice_select.IndiceSelector.select(
+        state, keys, queries, positions
+    )
+
+    def original_assembly(prefix, query):
+        return torch.cat([torch.stack(prefix), torch.stack(query)], dim=1)
+
+    def original_rotation(
+        rotary_emb,
+        token_positions,
+        tensor,
+        num_layers,
+        num_heads,
+        head_dim,
+        *,
+        is_query,
+    ):
+        flat = tensor.reshape(-1, num_heads, head_dim).contiguous()
+        scratch = torch.empty_like(flat)
+        if is_query:
+            rotated, _ = rotary_emb(token_positions.repeat(num_layers), flat, scratch)
+        else:
+            _, rotated = rotary_emb(token_positions.repeat(num_layers), scratch, flat)
+        return rotated.reshape(num_layers, -1, num_heads, head_dim)
+
+    # Compare each actual native RoPE result, not only a possibly stable top-k.
+    for heads, is_query in ((64, True), (8, False)):
+        raw = torch.randn(
+            3, 19 + batch, heads, 128, device="cuda", dtype=torch.bfloat16
+        )
+        pos = torch.arange(19 + batch, device="cuda").flip(0)
+        expected = original_rotation(
+            rotary, pos, raw.clone(), 3, heads, 128, is_query=is_query
+        )
+        rotated = indice_select.IndiceSelector._rotate_stacked(
+            rotary, pos, raw.clone(), 3, heads, 128, is_query=is_query
+        )
+        torch.testing.assert_close(rotated, expected, rtol=0, atol=0)
+    with monkeypatch.context() as reference:
+        reference.setattr(indice_select, "_assemble_selection_keys", original_assembly)
+        reference.setattr(
+            indice_select.IndiceSelector,
+            "_rotate_stacked",
+            staticmethod(original_rotation),
+        )
+        expected, expected_lengths = indice_select.IndiceSelector.select(
+            state, keys, queries, positions
+        )
+    assert torch.equal(actual, expected) and torch.equal(
+        actual_lengths, expected_lengths
+    )
+    for value, original in zip(keys + queries + query_keys, originals):
+        torch.testing.assert_close(value, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
 def test_compact_projection_values_preserve_normalized_qkv(batch):
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.layernorm import RMSNorm

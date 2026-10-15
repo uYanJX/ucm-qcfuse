@@ -244,8 +244,13 @@ def blend_layer(
                 layers = state.critical_layers or list(
                     range(state.attn_start, state.attn_end)
                 )
-                old_k, _ = state.get_kv_layers(layers)
+                old_k = state.get_kv_layers(layers)[0]
                 old_q = state.get_q_layers(layers)
+                if store is not None and sample_dir_chunk is not None:
+                    # Selection consumes only critical K. Later blend layers
+                    # reload their own V from the immutable backing store.
+                    for critical_layer in layers:
+                        state.v_buffer[int(critical_layer)] = None
                 indices, lens = indice_select.IndiceSelector.select(
                     state, old_k=old_k, old_q=old_q, positions=positions
                 )
