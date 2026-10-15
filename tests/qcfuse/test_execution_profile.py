@@ -135,3 +135,58 @@ def test_profile_rank_paths_keep_worker_traces_separate(tmp_path, profiler_calls
         worker.qcfuse_stop_execution_profile()
     paths = [call[1] for call in profiler_calls if isinstance(call, tuple)]
     assert paths == [str(tmp_path / "trace-0.json"), str(tmp_path / "trace-1.json")]
+
+
+def test_decode_interval_skips_prefill_and_removes_observer(tmp_path, profiler_calls):
+    model = torch.nn.Identity()
+    worker = _worker(model)
+    path = str(tmp_path / "decode.json")
+    worker.qcfuse_start_execution_profile(path, max_forwards=4, skip_forwards=2)
+    for _ in range(2):
+        model(torch.ones(5))
+    assert not profiler_calls
+    for _ in range(4):
+        model(torch.ones(1))
+    assert profiler_calls == ["start"]
+    model(torch.ones(1))
+    assert profiler_calls == ["start", "stop", ("export", path)]
+    assert not model._forward_pre_hooks
+    for _ in range(8):
+        model(torch.ones(1))
+    row = worker.qcfuse_stop_execution_profile()
+    assert row["forward_calls"] == 4
+    assert row["skipped_forward_calls"] == 2
+    assert profiler_calls.count("stop") == 1
+
+
+def test_short_request_never_starts_deferred_profiler(tmp_path, profiler_calls):
+    model = torch.nn.Identity()
+    worker = _worker(model)
+    worker.qcfuse_start_execution_profile(
+        str(tmp_path / "unused.json"), skip_forwards=2
+    )
+    model(torch.ones(5))
+    row = worker.qcfuse_stop_execution_profile()
+    assert not row["trace_written"] and row["forward_calls"] == 0
+    assert row["skipped_forward_calls"] == 1
+    assert not profiler_calls and not model._forward_pre_hooks
+
+
+@pytest.mark.parametrize("skip", [-1, 1.5, True])
+def test_profile_rejects_invalid_skip_before_start(tmp_path, profiler_calls, skip):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _worker(torch.nn.Identity()).qcfuse_start_execution_profile(
+            str(tmp_path / "invalid.json"), skip_forwards=skip
+        )
+    assert not profiler_calls
+
+
+def test_deferred_profile_failed_hook_install_does_not_stop_unstarted_profiler(
+    tmp_path, profiler_calls
+):
+    worker = _worker(SimpleNamespace(register_forward_pre_hook=None))
+    with pytest.raises(TypeError):
+        worker.qcfuse_start_execution_profile(
+            str(tmp_path / "failed.json"), skip_forwards=2
+        )
+    assert not profiler_calls

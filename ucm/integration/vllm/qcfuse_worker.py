@@ -84,12 +84,13 @@ class QcFuseWorkerExtension:
             ),
         }
 
-    def qcfuse_start_execution_profile(self, path, max_forwards=3):
-        """Profile a bounded eager prefix through a named, serializable RPC.
+    def qcfuse_start_execution_profile(self, path, max_forwards=3, skip_forwards=0):
+        """Profile a bounded eager interval through a named, serializable RPC.
 
         The next model forward stops the profiler and removes the observer.
         Call qcfuse_stop_execution_profile in a finally block as well, since
-        generation may finish before reaching that boundary. Detailed profiles
+        skip_forwards can exclude QCOMPUTE/prefill to observe decode alone.
+        Generation may finish before reaching that boundary. Detailed profiles
         are diagnostic and must never supply the formal latency measurement.
         """
         import os
@@ -99,6 +100,12 @@ class QcFuseWorkerExtension:
             raise ValueError("max_forwards must be a positive integer")
         if max_forwards < 1:
             raise ValueError("max_forwards must be a positive integer")
+        if (
+            isinstance(skip_forwards, bool)
+            or not isinstance(skip_forwards, int)
+            or skip_forwards < 0
+        ):
+            raise ValueError("skip_forwards must be a non-negative integer")
         previous = getattr(self, "_qcfuse_execution_profile", None)
         if previous is not None and previous["profiler"] is not None:
             raise RuntimeError("An execution profile is already active")
@@ -113,14 +120,24 @@ class QcFuseWorkerExtension:
             "path": path,
             "max_forwards": max_forwards,
             "forward_calls": 0,
+            "skip_forwards": skip_forwards,
+            "skipped_forward_calls": 0,
             "profiler": profiler,
+            "profiler_started": skip_forwards == 0,
             "hook": None,
             "trace_written": False,
         }
-        profiler.start()
+        if state["profiler_started"]:
+            profiler.start()
         self._qcfuse_execution_profile = state
 
         def before_forward(_model, _args):
+            if state["skipped_forward_calls"] < skip_forwards:
+                state["skipped_forward_calls"] += 1
+                return
+            if not state["profiler_started"]:
+                profiler.start()
+                state["profiler_started"] = True
             if state["forward_calls"] == max_forwards:
                 self.qcfuse_stop_execution_profile()
             else:
@@ -132,9 +149,15 @@ class QcFuseWorkerExtension:
             )
         except BaseException:
             state["profiler"] = None
-            profiler.stop()
+            if state["profiler_started"]:
+                profiler.stop()
             raise
-        return {"path": path, "max_forwards": max_forwards, "active": True}
+        return {
+            "path": path,
+            "max_forwards": max_forwards,
+            "skip_forwards": skip_forwards,
+            "active": True,
+        }
 
     def qcfuse_stop_execution_profile(self):
         """Stop and export once; leave no profiler callback on later decode."""
@@ -147,7 +170,7 @@ class QcFuseWorkerExtension:
             hook.remove()
         profiler = state["profiler"]
         state["profiler"] = None
-        if profiler is not None:
+        if profiler is not None and state["profiler_started"]:
             profiler.stop()
             profiler.export_chrome_trace(state["path"])
             state["trace_written"] = True
@@ -155,6 +178,7 @@ class QcFuseWorkerExtension:
             "active": False,
             "path": state["path"],
             "forward_calls": state["forward_calls"],
+            "skipped_forward_calls": state["skipped_forward_calls"],
             "trace_written": state["trace_written"],
         }
 

@@ -742,9 +742,10 @@ def test_gpu_resident_lazy_load_keeps_source_bytes_immutable(tmp_path, batch):
         transfer.release_resident_files()
 
 
+@pytest.mark.parametrize("skip", [0, 2])
 @pytest.mark.parametrize("batch", [1, 2, 4])
 def test_bounded_worker_profile_keeps_cuda_outputs_and_removes_decode_hook(
-    tmp_path, batch
+    tmp_path, batch, skip
 ):
     import json
     from types import SimpleNamespace
@@ -757,11 +758,12 @@ def test_bounded_worker_profile_keeps_cuda_outputs_and_removes_decode_hook(
     worker = QcFuseWorkerExtension()
     worker.model_runner = SimpleNamespace(model=model)
     path = tmp_path / "execution.json"
-    worker.qcfuse_start_execution_profile(str(path), max_forwards=2)
-    for _ in range(4):
+    worker.qcfuse_start_execution_profile(str(path), max_forwards=2, skip_forwards=skip)
+    for _ in range(4 + skip):
         torch.testing.assert_close(model(value), expected, rtol=0, atol=0)
     row = worker.qcfuse_stop_execution_profile()
     assert row["trace_written"] and row["forward_calls"] == 2
+    assert row["skipped_forward_calls"] == skip
     assert not model._forward_pre_hooks
     trace = json.loads(path.read_text())
     assert any(event.get("cat") == "kernel" for event in trace["traceEvents"])
