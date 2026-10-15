@@ -164,6 +164,28 @@ def validate_query_alias(query_path, source_path):
     query_meta = pf.load_query_meta(os.fspath(Path(query_path).parent))
     positions_by_layer = query_meta["metadata"]["context_positions_by_layer"]
     total_tokens = query_meta["metadata"]["total_tokens"]
+    # Digest positions cover prefix/context only; the full source and critical
+    # section also include the original query. Augmented zip rows have already
+    # been stripped using the source's token_indices.
+    full_tokens = total_tokens
+    ranges = query_meta["metadata"].get("orig_chunk_ranges")
+    if ranges:
+        previous = 0
+        for span in ranges:
+            if (
+                not isinstance(span, (list, tuple))
+                or len(span) != 2
+                or any(isinstance(x, bool) or not isinstance(x, int) for x in span)
+                or span[0] != previous
+                or span[1] < span[0]
+            ):
+                raise ValueError("Query alias has invalid original chunk ranges")
+            previous = span[1]
+        if ranges[-1][0] != total_tokens:
+            raise ValueError(
+                "Query alias has a different full token count or context boundary"
+            )
+        full_tokens = ranges[-1][1]
     bindings = []
     with open(source_path, "rb") as source, open(query_path, "rb") as query:
         for section in ("digest", "critical"):
@@ -188,7 +210,7 @@ def validate_query_alias(query_path, source_path):
                         raise ValueError(
                             "GPU query alias requires matching BF16 tensors"
                         )
-                    if full["shape"][0] != total_tokens:
+                    if full["shape"][0] != full_tokens:
                         raise ValueError("Query alias has a different full token count")
                     expected_shape = (
                         [len(positions), *full["shape"][1:]]

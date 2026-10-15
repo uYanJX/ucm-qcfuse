@@ -21,12 +21,13 @@ def clean_registry(tmp_path):
         path.unlink()
 
 
-def pair(root, tokens=11):
+def pair(root, tokens=11, query_tokens=0):
     tensors = {}
     for layer in range(3):
         key = torch.arange(tokens * 8).reshape(tokens, 2, 4).to(torch.bfloat16)
         tensors[layer] = key + layer * 100, -key - layer * 100
-    positions = [[tokens - 1, 1, 4], [0, tokens - 2], [3]]
+    context_end = tokens - query_tokens
+    positions = [[context_end - 1, 1, 4], [0, context_end - 2], [3]]
     chunk, query = root / "chunk", root / "query"
     pf.save_packed_kv(str(chunk), tensors, 3)
     pf.save_query_cache(
@@ -36,7 +37,11 @@ def pair(root, tokens=11):
         {layer: torch.tensor(indices) for layer, indices in enumerate(positions)},
         [1, 2],
         tensors,
-        {"total_tokens": tokens, "context_positions_by_layer": positions},
+        {
+            "total_tokens": context_end,
+            "orig_chunk_ranges": [[0, 1], [1, context_end], [context_end, tokens]],
+            "context_positions_by_layer": positions,
+        },
         {},
     )
     return chunk / "kv_packed.bin", query / "query_packed.bin", tensors, positions
@@ -73,6 +78,33 @@ def test_query_alias_proves_ordered_byte_mapping_and_owns_outputs(tmp_path):
             actual.fill_(99)
             torch.testing.assert_close(
                 alias.owned_tensor(item), expected, rtol=0, atol=0
+            )
+    finally:
+        alias.close()
+        reader.close()
+
+
+def test_query_alias_preserves_full_query_tail_and_context_only_digest(tmp_path):
+    source, query, tensors, positions = pair(tmp_path, query_tokens=2)
+    reader = transfer._ResidentReader(
+        torch.tensor(list(source.read_bytes()), dtype=torch.uint8), "gpu"
+    )
+    alias = QueryAliasReader(
+        str(query),
+        str(source),
+        reader,
+        validate_query_alias(str(query), str(source)),
+        "cpu",
+    )
+    try:
+        for section, layer, name, item in query_items(query):
+            expected = tensors[layer][name == "v"]
+            if section == "digest":
+                expected = expected[positions[layer]]
+            actual = alias.owned_tensor(item)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert actual.shape[0] == (
+                len(positions[layer]) if section == "digest" else 11
             )
     finally:
         alias.close()
@@ -154,7 +186,7 @@ def test_cuda_alias_reuse_is_bit_exact_without_files(
 ):
     if codec:
         pytest.importorskip("nvidia.nvcomp")
-    cases = [pair(tmp_path / str(i), 11 + i) for i in range(batch)]
+    cases = [pair(tmp_path / str(i), 11 + i, query_tokens=2) for i in range(batch)]
     paths = [str(p) for source, query, _, _ in cases for p in (source, query)]
     aliases = {str(query): str(source) for source, query, _, _ in cases}
     items = {str(query): query_items(query) for _, query, _, _ in cases}
