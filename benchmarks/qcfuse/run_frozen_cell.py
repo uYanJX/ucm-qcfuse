@@ -94,6 +94,14 @@ def gpu_preload_unavailable(args, indexed_batch, manifest, error):
     }
 
 
+def measurement_repeats(kind, timing_repeats=10, audit_repeats=1):
+    if timing_repeats < 1 or audit_repeats < 1:
+        raise ValueError("Measurement repeat counts must be positive")
+    return (
+        timing_repeats if kind == "timing" else audit_repeats if kind == "audit" else 1
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True)
@@ -124,6 +132,7 @@ def main():
     parser.add_argument("--io-group-layers", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--audit-repeats", type=int, default=1)
     parser.add_argument(
         "--timing-samples",
         type=int,
@@ -148,6 +157,7 @@ def main():
         or args.batch_size < 1
         or args.warmup < 0
         or args.repeats < 1
+        or args.audit_repeats < 1
         or (args.max_new_tokens is not None and args.max_new_tokens < 1)
         or (args.kv_cache_memory_bytes is not None and args.kv_cache_memory_bytes < 1)
         or args.gpu_headroom_bytes_per_token < 0
@@ -246,6 +256,9 @@ def main():
         ),
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
         "runtime_controls": {
+            "measurements_per_source": measurement_repeats(
+                args.kind, args.repeats, args.audit_repeats
+            ),
             "execute_model_rpc_timeout_seconds": int(
                 os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
             ),
@@ -400,7 +413,9 @@ def main():
                                 **warmup,
                             }
                         )
-                    repeats = args.repeats if args.kind == "timing" else 1
+                    repeats = measurement_repeats(
+                        args.kind, args.repeats, args.audit_repeats
+                    )
                     for repeat in range(repeats):
                         if (
                             args.baseline == "ours"

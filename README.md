@@ -166,6 +166,11 @@ adopting it. `QCFUSE_FLEX_KEY_BLOCK=64` (default) or `128` controls key tiling.
 Worker benchmark snapshots report actual native/flex layer-call counts;
 frozen receipts record the backend and block size.
 
+Audit defaults to one observation. Use `--audit-repeats 2` to verify two
+continuous requests against the same resident source. `--repeats` controls
+timing observations only; quality retains one observation per source. Receipts
+record the effective measurement count separately from CLI options.
+
 ## Native decode graph experiment
 
 The frozen runner accepts `--decode-cudagraph on` (default: `off`). It uses
