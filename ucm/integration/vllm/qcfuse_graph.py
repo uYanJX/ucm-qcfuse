@@ -25,8 +25,16 @@ def install_v2_graph_hooks(runner, has_sparse, get_sparse):
             result = original_pre_forward(*args, **kwargs)
             scheduler = kwargs.get(
                 "scheduler_output",
-                getattr(runner, "_ucm_latest_pending_scheduler_output", None),
+                (
+                    args[0]
+                    if args
+                    else getattr(runner, "_ucm_latest_pending_scheduler_output", None)
+                ),
             )
+            # V2 also calls pre_forward for a zero-token cleanup/heartbeat.
+            # That path has no input batch or forward context to inspect.
+            if getattr(scheduler, "total_num_scheduled_tokens", None) == 0:
+                return result
             if scheduler is not None and has_sparse():
                 if "attn_metadata" in kwargs:
                     attn_metadata = kwargs["attn_metadata"]

@@ -153,3 +153,20 @@ def test_public_pipeline_constructor_forwards_graph_option(monkeypatch, enabled)
     engine = SSDPipelineEngine("model", decode_cudagraph=enabled)
     assert calls[0]["decode_cudagraph"] is enabled
     assert engine.storage_mode == "ssd"
+
+
+def test_zero_token_cleanup_does_not_require_forward_context(monkeypatch):
+    import vllm.forward_context
+
+    def forbidden():
+        raise AssertionError("No forward context exists during cleanup")
+
+    monkeypatch.setattr(vllm.forward_context, "get_forward_context", forbidden)
+    events = []
+    runner = _runner(events)
+    sparse = SimpleNamespace(build_sparse_meta=lambda *args: forbidden())
+    install_v2_graph_hooks(runner, lambda: True, lambda: sparse)
+    scheduler = SimpleNamespace(total_num_scheduled_tokens=0)
+    runner.kv_connector.pre_forward(scheduler)
+    assert events == ["bind"]
+    assert runner._ucm_latest_sparse_meta_built_for is None
