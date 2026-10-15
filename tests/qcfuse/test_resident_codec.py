@@ -322,10 +322,12 @@ def test_cuda_residency_retains_used_bytes_instead_of_worst_case_capacity(tmp_pa
         prepared["resident_gpu_bytes"] < prepared["resident_gpu_logical_bytes"] * 0.75
     )
     reader = transfer.resident_reader(path)
-    assert all(
-        payload.untyped_storage().nbytes() == payload.numel()
+    storages = {
+        payload.untyped_storage().data_ptr(): payload.untyped_storage().nbytes()
         for payload in reader._entries.values()
-    )
+    }
+    assert len(storages) == 1 and sum(storages.values()) == reader.size
+    assert all(payload.data_ptr() % 256 == 0 for payload in reader._entries.values())
     values = transfer.load_packed_layer(
         str(tmp_path),
         pf.load_packed_meta(str(tmp_path)),
@@ -335,3 +337,35 @@ def test_cuda_residency_retains_used_bytes_instead_of_worst_case_capacity(tmp_pa
     )
     for value in values:
         assert torch.equal(value.cpu().view(torch.uint8), raw.view(torch.uint8))
+
+
+@cuda
+def test_cuda_slab_failure_frees_gpu_storage_even_with_retained_traceback(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("nvidia.nvcomp")
+    from ucm.store.qcfuse import resident_codec
+
+    raw = torch.zeros((65536, 1, 128), dtype=torch.bfloat16)
+    pf.save_packed_kv(str(tmp_path), {0: (raw, raw)}, 1)
+    original = resident_codec._codec
+    calls = 0
+
+    def fail_decoder(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise RuntimeError("forced post-slab decoder failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(resident_codec, "_codec", fail_decoder)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    with pytest.raises(RuntimeError, match="post-slab decoder failure") as retained:
+        transfer.prepare_resident_batch(
+            None, [str(tmp_path / "kv_packed.bin")], "gpu", gpu_codec="ans_f16_bits"
+        )
+    assert retained.value.__traceback__ is not None
+    torch.cuda.synchronize()
+    assert transfer.resident_metrics()["resident_files"] == 0
+    assert torch.cuda.memory_allocated() <= before + 1024**2

@@ -55,6 +55,7 @@ class CompressedResidentReader:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.logical_size = os.path.getsize(path)
         self._entries = {}
+        self._slab = None
         self._local = threading.local()
         self.size = 0
         parent = os.fspath(Path(path).parent)
@@ -79,6 +80,8 @@ class CompressedResidentReader:
         encoder = _codec(self.device, stream)
         configs = {}
         nvcomp = _nvcomp_module()
+        staging = []
+        raw = encoded = encoded_view = view = None
         try:
             with open(path, "rb", buffering=0) as source:
                 for item in items:
@@ -112,15 +115,44 @@ class CompressedResidentReader:
                     encoded_view = torch.from_dlpack(encoded).view(torch.uint8)
                     if not 0 < used_bytes <= encoded_view.numel():
                         raise ValueError("Invalid lossless codec output size")
-                    payload = encoded_view[:used_bytes].clone()
+                    # Stage only compressed bytes outside online timing. Raw
+                    # GPU input blocks must not become partly occupied by
+                    # smaller permanent clones: those holes can strand GiBs
+                    # needed by one full-size FFN GEMM.
+                    payload = encoded_view[:used_bytes].to(device="cpu", copy=True)
                     stream.synchronize()
-                    self._entries[item_key(item)] = payload
-                    self.size += payload.numel()
+                    staging.append((item_key(item), payload))
                     del encoded_view, encoded, raw, host, data
+                    raw = encoded = encoded_view = None
+            decoder_sizes = tuple(configs)
+            configs.clear()
+            config = encoder = None
+            stream.synchronize()
+            torch.cuda.empty_cache()
+            # Each source starts at a 256-byte boundary for nvCOMP's alignment
+            # requirements. Count one physical allocation, including padding.
+            self.size = sum(
+                (payload.numel() + 255) // 256 * 256 for _, payload in staging
+            )
+            self._slab = torch.empty(self.size, dtype=torch.uint8, device=self.device)
+            offset = 0
+            for key, payload in staging:
+                view = self._slab[offset : offset + payload.numel()]
+                view.copy_(payload, non_blocking=False)
+                self._entries[key] = view
+                offset += (payload.numel() + 255) // 256 * 256
+            view = None
+            staging.clear()
+            stream.synchronize()
             # Prepare the model thread's decode state before online timing.
-            for nbytes in configs:
+            for nbytes in decoder_sizes:
                 self._decoder(nbytes)
         except BaseException:
+            # Exception tracebacks must not retain a view of the whole slab.
+            raw = encoded = encoded_view = view = None
+            config = encoder = None
+            configs.clear()
+            staging.clear()
             self.close()
             raise
 
@@ -156,6 +188,7 @@ class CompressedResidentReader:
 
     def close(self):
         self._entries.clear()
+        self._slab = None
         self._local = threading.local()
 
 
