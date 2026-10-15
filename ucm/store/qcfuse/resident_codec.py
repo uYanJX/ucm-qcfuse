@@ -105,8 +105,14 @@ class CompressedResidentReader:
                     # Preload runs outside online timing. Compact foreign
                     # worst-case capacity before retaining the resident bytes.
                     stream.synchronize()
+                    # nvCOMP resolves its pending compressed size lazily.
+                    # Exporting DLPack first exposes the maximum capacity and
+                    # permanently fixes that larger shape on the Torch view.
+                    used_bytes = int(encoded.buffer_size)
                     encoded_view = torch.from_dlpack(encoded).view(torch.uint8)
-                    payload = encoded_view.clone()
+                    if not 0 < used_bytes <= encoded_view.numel():
+                        raise ValueError("Invalid lossless codec output size")
+                    payload = encoded_view[:used_bytes].clone()
                     stream.synchronize()
                     self._entries[item_key(item)] = payload
                     self.size += payload.numel()

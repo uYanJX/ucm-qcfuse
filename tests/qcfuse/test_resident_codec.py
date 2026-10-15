@@ -305,3 +305,33 @@ def test_cuda_partial_compressed_preload_can_retry(tmp_path, monkeypatch):
         )["resident_files"]
         == 2
     )
+
+
+@cuda
+def test_cuda_residency_retains_used_bytes_instead_of_worst_case_capacity(tmp_path):
+    pytest.importorskip("nvidia.nvcomp")
+    raw = torch.zeros((65536, 1, 128), dtype=torch.bfloat16)
+    pf.save_packed_kv(str(tmp_path), {0: (raw, raw)}, 1)
+    path = str(tmp_path / "kv_packed.bin")
+    prepared = transfer.prepare_resident_batch(
+        None, [path], "gpu", gpu_codec="ans_f16_bits"
+    )
+    # ANS' lossless 16-bit symbol layout compresses this large constant source
+    # below 75%. The codec's worst-case allocation is larger than the raw data.
+    assert (
+        prepared["resident_gpu_bytes"] < prepared["resident_gpu_logical_bytes"] * 0.75
+    )
+    reader = transfer.resident_reader(path)
+    assert all(
+        payload.untyped_storage().nbytes() == payload.numel()
+        for payload in reader._entries.values()
+    )
+    values = transfer.load_packed_layer(
+        str(tmp_path),
+        pf.load_packed_meta(str(tmp_path)),
+        0,
+        "cuda:0",
+        kind="codec_test",
+    )
+    for value in values:
+        assert torch.equal(value.cpu().view(torch.uint8), raw.view(torch.uint8))
