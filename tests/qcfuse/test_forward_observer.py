@@ -95,7 +95,9 @@ def test_only_gpu_preload_oom_is_tagged_before_online_submission(tmp_path, mode)
         raise RuntimeError("Worker failed: CUDA out of memory")
 
     engine.llm = SimpleNamespace(collective_rpc=failed_rpc)
-    sample = SimpleNamespace(sample_dir_chunk=tmp_path, sample_dir_query=tmp_path)
+    sample = SimpleNamespace(
+        sample_dir_chunk=tmp_path, sample_dir_query=tmp_path, input_tokens=128
+    )
     with pytest.raises(RuntimeError) as raised:
         engine._prepare_resident_batch([sample])
     assert isinstance(raised.value, GpuResidentPreloadCapacityError) == (mode == "gpu")
@@ -114,7 +116,9 @@ def test_non_capacity_rpc_failure_is_not_tagged_as_unsupported_input(tmp_path):
         raise RuntimeError("Invalid cache metadata")
 
     engine.llm = SimpleNamespace(collective_rpc=failed_rpc)
-    sample = SimpleNamespace(sample_dir_chunk=tmp_path, sample_dir_query=tmp_path)
+    sample = SimpleNamespace(
+        sample_dir_chunk=tmp_path, sample_dir_query=tmp_path, input_tokens=128
+    )
     with pytest.raises(RuntimeError) as raised:
         engine._prepare_resident_batch([sample])
     assert not isinstance(raised.value, GpuResidentPreloadCapacityError)
