@@ -1,0 +1,22 @@
+[build-system]
+requires = [
+    "setuptools>=64",
+    "cmake>=3.18",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uc-manager"
+authors = [{name = "Unified Cache Team"}]
+license = { file="LICENSE" }
+readme = "README.md"
+description = "Persist and reuse KV Cache to speedup your LLM."
+requires-python = ">=3.10"
+dependencies = ["wrapt==1.17.2"]
+dynamic = [ "version", "optional-dependencies"]
+
+[project.urls]
+Homepage="https://github.com/ModelEngine-Group/unified-cache-management"
+Documentation="https://ucm.readthedocs.io/en/latest"
+WeChat="https://github.com/ModelEngine-Group/unified-cache-management/blob/develop/docs/source/_static/images/qrcode_for_wechat.png?raw=true"

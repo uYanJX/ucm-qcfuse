@@ -1,45 +1,23 @@
-# Repository Guidelines
+# Repository guidance
 
-## Project Structure & Module Organization
+This branch is a source distribution. Edit `ucm/` directly; do not introduce
+an overlay directory or an external patch-file installation step.
 
-This repository is a focused overlay, not a standalone UCM distribution.
-`overlay/ucm/sparse/qcfuse/` contains request state, batching, selection, and
-attention logic. `overlay/ucm/store/qcfuse/` owns packed cache files and bounded
-SSD-to-GPU prefetch. vLLM integration files live under
-`overlay/ucm/integration/vllm/`; edits to existing UCM files are captured in
-`patches/ucm-vllm-v0110-integration.patch`. Tests and evaluation tools are in
-`tests/qcfuse/` and `benchmarks/qcfuse/`.
+QCFuse computation is in `ucm/sparse/qcfuse/`; cache transport is in
+`ucm/store/qcfuse/`; current vLLM integration is in
+`ucm/integration/vllm/latest_sparse.py` and the QCFuse connector/worker modules.
+Use the supported runtime in README.md rather than historical adapters.
 
-## Build, Test, and Development Commands
+Preserve pre-RoPE cache semantics, request-local mutation, selected token
+budgets, explicit position-based attention masks and CUDA stream ownership.
+Algorithm changes require differential validation against the pinned reference.
+Kernel, transfer and batching changes require CUDA checks for batch sizes
+1, 2 and 4, including repeated cache reuse and cleanup.
 
-Apply the patch and overlay to the UCM revision listed in `README.md` before
-running code. Use `pytest -q tests/qcfuse -k "not cuda"` for CPU regressions.
-Run CUDA checks with `CUDA_VISIBLE_DEVICES=0 pytest -q tests/qcfuse`; set
-`QCFUSE_REFERENCE_DIR=/path/to/QCFuse` to enable the upstream differential.
-Format Python with `black --target-version py310 overlay tests benchmarks` and
-validate the integration patch with `git apply --check patches/*.patch` from a
-clean compatible UCM checkout.
+Run `PYTHONPATH="$PWD" python -m pytest -q tests/qcfuse -k 'not cuda'` for CPU
+regressions, and run `tests/qcfuse/test_cuda_kernels.py` on an idle CUDA device.
+Format changed Python with Black targeting Python 3.10.
 
-## Coding Style & Naming Conventions
-
-Use Python 3.10+, four-space indentation, Black formatting, and type hints on
-public boundaries. Name modules and functions in `snake_case`, classes in
-`PascalCase`, and tests `test_*.py`. Keep comments for non-obvious invariants,
-especially stream ownership, tensor layouts, cache positions, and batching.
-Do not retain development-phase notes or commented-out experiments.
-
-## Testing Guidelines
-
-Add focused CPU coverage for metadata and layout changes. Kernel or stream
-changes require CUDA tests, and algorithm changes require a differential check
-against the pinned upstream revision. Exercise batch sizes 1, 2, and 4 when
-changing request slicing or ragged attention. Never commit model outputs,
-generated cache files, or benchmark logs.
-
-## Commit & Pull Request Guidelines
-
-Use concise imperative subjects such as `[Fix] Preserve CUDA stream ownership`.
-Keep overlay code and its integration-patch update in the same commit. Pull
-requests should state the compatible UCM/vLLM versions, describe behavioral
-changes, list exact test commands, and report quality or timing impact for
-performance-sensitive changes.
+Never commit models, datasets, cache payloads, generated predictions, raw
+experiment records, local host configuration or credentials. Use generic paths
+in documentation and preserve upstream licenses and attribution.

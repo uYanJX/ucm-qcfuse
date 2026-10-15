@@ -1,8 +1,10 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
 from ucm.sparse.qcfuse.batch import QcFuseStepBatch, cumulative_starts
 from ucm.sparse.qcfuse.blend_info import BlendStyle, QcFuseRequestState
+from ucm.sparse.qcfuse.qcfuse import QcFuse
 
 
 def _state(phase, session, start=2, qcompute_end=4):
@@ -39,6 +41,33 @@ def test_decode_step_is_not_rewritten():
     assert batch.entries[0].is_decode
 
 
+def test_do_blend_reuses_qcompute_handoff():
+    fuser = object.__new__(QcFuse)
+    fuser._store = None
+    fuser._qcompute_reuse_hits = 0
+    fuser._qcompute_reuse_misses = 0
+    fuser._qcompute_stash = {
+        "session": {
+            "q_buffer": ["q"],
+            "query_k_buffer": ["k"],
+            "q_lens": [1],
+            "q_offsets": [0],
+            "query_k_lens": [1],
+        }
+    }
+    state = QcFuseRequestState(query_session_id="session")
+
+    fuser._materialize_blend_inputs(state)
+
+    assert state.qcompute_reused
+    assert state.q_buffer == ["q"]
+    assert fuser.qcompute_reuse_stats() == {
+        "qcompute_reuse_hits": 1,
+        "qcompute_reuse_misses": 0,
+        "qcompute_stash_size": 0,
+    }
+
+
 @pytest.mark.parametrize(
     "states,error",
     [
@@ -72,3 +101,16 @@ def test_rejects_chunked_prefill():
             [0],
             [6],
         )
+
+
+@pytest.mark.parametrize("storage", ["gpu", "cpu", "ssd"])
+@pytest.mark.parametrize("phase", list(BlendStyle))
+def test_projection_compaction_is_limited_to_gpu_blend(storage, phase):
+    fuser = object.__new__(QcFuse)
+    fuser._store = SimpleNamespace(storage_mode=storage)
+    fuser._step = SimpleNamespace(active=True, phase=phase)
+    assert fuser.compact_projection_values() == (
+        storage == "gpu" and phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH)
+    )
+    fuser._step.active = False
+    assert not fuser.compact_projection_values()

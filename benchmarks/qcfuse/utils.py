@@ -25,15 +25,37 @@
 """
 LongBench / RULER utilities for Blend evaluation.
 
-Supports: hotpotqa, 2wikimqa, musique, ruler_vt, ruler_mq, ruler_mv
-Metrics : F-Measure, string-match-all
+The benchmark runner must preserve the complete context.  In particular,
+LongBench v2 stores context as one large string while HotpotQA stores a list of
+passages; treating both values as an iterable of passages silently truncated or
+split the LongBench input in the old implementation.
 """
 
 import json
+import re
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 
-RULER_DATASETS = ("ruler_vt", "ruler_mq", "ruler_mv")
+RULER_DATASETS = (
+    "ruler_64k",
+    "ruler_cwe",
+    "ruler_fwe",
+    "ruler_niah_multikey_1",
+    "ruler_niah_multikey_2",
+    "ruler_niah_multikey_3",
+    "ruler_niah_multiquery",
+    "ruler_niah_multivalue",
+    "ruler_niah_single_1",
+    "ruler_niah_single_2",
+    "ruler_niah_single_3",
+    "ruler_qa_1",
+    "ruler_qa_2",
+    "ruler_vt",
+    "ruler_mq",
+    "ruler_mv",
+)
+
+LONG_BENCH_DATASETS = ("longbench_v2",)
 
 SYSTEM_PROMPT = (
     "You are a highly precise question-answering assistant.\n\n"
@@ -120,6 +142,20 @@ RULER_QUERY_PREFIX = {
     ),
 }
 
+GENERIC_RULER_SYSTEM = (
+    "Read the text below and answer the question using only information from it. "
+    "Return only the answer without an explanation.\n\n## Text\n"
+)
+GENERIC_RULER_QUERY = (
+    "Answer the question using only the provided text. "
+    "Return only the answer without an explanation.\n\n## Question\n"
+)
+
+LONGBENCH_QUERY_PREFIX = (
+    "Answer the multiple-choice question using only the provided context. "
+    "Return only the option letter (A, B, C, or D).\n\n## Question\n"
+)
+
 MAX_NEW_TOKENS = 48
 
 MAX_NEW_TOKENS_BY_DATASET = {
@@ -128,16 +164,21 @@ MAX_NEW_TOKENS_BY_DATASET = {
     "ruler_mv": 128,
 }
 
-DEFAULT_CHUNK_TOPK = 20
 
-
-def load_dataset(dataset_path: str) -> List[Dict]:
-    """Load a JSONL dataset file."""
+def load_dataset(dataset_path: str, limit: Optional[int] = None) -> List[Dict]:
+    """Load up to ``limit`` records from a JSONL dataset file."""
     path = Path(dataset_path)
     if not path.exists():
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
     with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        records = []
+        for line in f:
+            if not line.strip():
+                continue
+            records.append(json.loads(line))
+            if limit is not None and len(records) >= limit:
+                break
+        return records
 
 
 def normalize_question(question: str) -> str:
@@ -158,14 +199,42 @@ def build_prompt_for_dataset(
         docs: list of passage strings
         q_prompt: [query_prefix, input_text]
     """
+    if example.get("prompt_format") == "ruler_official_chat":
+        # The generator's instruction and context stay verbatim. Only chat
+        # role wrappers and QCFuse document boundaries are added.
+        return [example["context"]], ["", example["input"]]
     context = example.get("context", "")
-    if dataset_name not in RULER_DATASETS:
-        context = context[: min(len(context), DEFAULT_CHUNK_TOPK)]
-    docs = [f"Passage:\n{ctx}\n\n" for ctx in context]
+    if isinstance(context, str):
+        context_parts = [context] if context else []
+    elif context is None:
+        context_parts = []
+    else:
+        # LongBench uses a string, while the other long-context datasets may
+        # provide a list of passages.  Preserve every supplied passage.
+        context_parts = [
+            item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+            for item in context
+        ]
+    docs = [f"Passage:\n{ctx}\n\n" for ctx in context_parts]
 
     input_text = example.get("input", "")
     if dataset_name in RULER_DATASETS:
-        return docs, [RULER_QUERY_PREFIX[dataset_name], input_text]
+        return docs, [
+            RULER_QUERY_PREFIX.get(dataset_name, GENERIC_RULER_QUERY),
+            input_text,
+        ]
+
+    if dataset_name in LONG_BENCH_DATASETS:
+        question = example.get("question", input_text)
+        choices = []
+        for label in ("A", "B", "C", "D"):
+            if f"choice_{label}" in example:
+                choices.append(f"{label}. {example[f'choice_{label}']}")
+        choice_text = "\n".join(choices)
+        query = str(question)
+        if choice_text:
+            query = f"{query}\n\n{choice_text}"
+        return docs, [LONGBENCH_QUERY_PREFIX, query]
 
     return docs, [QUERY_PREFIX, normalize_question(input_text)]
 
@@ -200,25 +269,58 @@ TASK_METRICS = {
     "ruler_vt": "string_match_all",
     "ruler_mq": "string_match_all",
     "ruler_mv": "string_match_all",
+    "ruler_64k": "string_match_all",
+    "longbench_v2": "accuracy",
 }
 
 METRIC_DISPLAY = {
     "f1": "F1",
     "string_match_all": "sm",
+    "accuracy": "Accuracy",
 }
+
+
+def scorer_accuracy(prediction: str, ground_truth: str) -> float:
+    """Score a LongBench v2 multiple-choice answer."""
+    expected = str(ground_truth).strip().upper()
+    if not expected:
+        return 0.0
+    response = str(prediction).replace("*", "").strip()
+    # Official LongBench v2 pred.py extracts these final-answer phrases.
+    match = re.search(r"The correct answer is \(([A-D])\)", response)
+    if match is None:
+        match = re.search(r"The correct answer is ([A-D])", response)
+    if match is None:
+        # This runner also requests a bare option letter. Reject ambiguous
+        # multi-letter strings rather than accepting the first character.
+        match = re.fullmatch(r"\(?([A-D])\)?[.)]?", response.upper())
+    return float(match is not None and match.group(1) == expected)
 
 
 def evaluate_sample(
     prediction: str,
     ground_truths: List[str],
     dataset_name: str,
+    ruler_task: Optional[str] = None,
 ) -> float:
     """Evaluate prediction against ground truths; returns max score."""
     if not ground_truths:
         return 0.0
+    if ruler_task or dataset_name.startswith("ruler"):
+        if ruler_task in ("qa_1", "qa_2") or dataset_name in (
+            "ruler_qa_1",
+            "ruler_qa_2",
+        ):
+            return max(
+                float(str(truth).lower() in prediction.lower())
+                for truth in ground_truths
+            )
+        return scorer_string_match_all(prediction, ground_truths)
     metric_type = TASK_METRICS.get(dataset_name, "f1")
     if metric_type == "string_match_all":
         return scorer_string_match_all(prediction, ground_truths)
+    if metric_type == "accuracy":
+        return max(scorer_accuracy(prediction, truth) for truth in ground_truths)
 
     best = 0.0
     for truth in ground_truths:
@@ -229,13 +331,31 @@ def evaluate_sample(
 
 
 def get_system_prompt(_dataset_name: str) -> str:
-    return RULER_SYS_INSTRUCT.get(_dataset_name, SYSTEM_PROMPT)
+    if _dataset_name in RULER_DATASETS:
+        return RULER_SYS_INSTRUCT.get(_dataset_name, GENERIC_RULER_SYSTEM)
+    return SYSTEM_PROMPT
 
 
 def get_max_new_tokens(_dataset_name: str) -> int:
+    if _dataset_name.startswith("ruler"):
+        return MAX_NEW_TOKENS_BY_DATASET.get(_dataset_name, 128)
     return MAX_NEW_TOKENS_BY_DATASET.get(_dataset_name, MAX_NEW_TOKENS)
 
 
 def get_metric_name(dataset_name: str) -> str:
+    if dataset_name.startswith("ruler"):
+        return "sm"
     metric_type = TASK_METRICS.get(dataset_name, "f1")
     return METRIC_DISPLAY.get(metric_type, "Score")
+
+
+def sample_prompt_parts(example: Dict, dataset_name: str):
+    docs, query = build_prompt_for_dataset(example, dataset_name)
+    if example.get("prompt_format") == "ruler_official_chat":
+        return (
+            "",
+            docs,
+            query,
+            {"answer_suffix": "", "answer_prefix": example.get("answer_prefix", "")},
+        )
+    return get_system_prompt(dataset_name), docs, query, {}

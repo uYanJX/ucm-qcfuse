@@ -1,0 +1,320 @@
+#
+# MIT License
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+import atexit
+import os
+import subprocess
+import sys
+import sysconfig
+
+from setuptools import Extension, find_packages, setup
+from setuptools.command.build_ext import build_ext
+
+ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
+PLATFORM = os.getenv("PLATFORM")
+ENABLE_SPARSE = os.getenv("ENABLE_SPARSE")
+BUILD_UCM_ASU = os.getenv("BUILD_UCM_ASU", "0") not in ("", "0", "false", "False")
+BUILD_KV_CLIENT_PROVIDER_AIV = os.getenv("BUILD_KV_CLIENT_PROVIDER_AIV", "0") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+BUILD_KV_CLIENT_PROVIDER_AICPU = os.getenv(
+    "BUILD_KV_CLIENT_PROVIDER_AICPU", "0"
+) not in ("", "0", "false", "False")
+ENABLE_MINDIE = os.getenv("UCM_ENABLE_MINDIE", "0") not in ("", "0", "false", "False")
+ENABLE_GDR = os.getenv("ENABLE_GDR", "0") not in ("", "0", "false", "False")
+ASCEND_ROOT = os.getenv("ASCEND_ROOT")
+
+
+def get_package_version() -> str:
+    version_path = os.path.join(ROOT_DIR, "version.ini")
+    try:
+        with open(version_path, encoding="utf-8") as version_file:
+            for line in version_file:
+                key, separator, value = line.strip().partition("=")
+                if separator and key == "UCM_VERSION" and value:
+                    return value
+    except OSError as error:
+        raise RuntimeError(
+            f"cannot read package version from {version_path}"
+        ) from error
+    raise RuntimeError(f"UCM_VERSION is missing from {version_path}")
+
+
+def get_abi_flag_from_env() -> str:
+    v = os.environ.get("UCM_CXX11_ABI")
+    if v is None:
+        raise RuntimeError(
+            "You must set env UCM_CXX11_ABI=0 or 1 to build with MindIE.\n"
+            "Example:\n"
+            "  UCM_ENABLE_MINDIE=1 UCM_CXX11_ABI=0 python -m build -w\n"
+            "  UCM_ENABLE_MINDIE=1 UCM_CXX11_ABI=1 python -m build -w"
+        )
+    if v not in ("0", "1"):
+        raise RuntimeError(f"Invalid UCM_CXX11_ABI={v}, expected 0 or 1")
+    return v
+
+
+UCM_CXX11_ABI = get_abi_flag_from_env() if ENABLE_MINDIE else None
+_warning_printed = False
+
+
+def print_platform_warning():
+    global _warning_printed
+    if not PLATFORM and not _warning_printed:
+        _warning_printed = True
+        RED = "\033[91m"
+        YELLOW = "\033[93m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+
+        warning_msg = f"""
+{RED}{'=' * 80}
+{BOLD}⚠️  WARNING: PLATFORM environment variable is not set! ⚠️{RESET}
+{RED}{'=' * 80}{RESET}
+{YELLOW}Please set PLATFORM to one of: cuda, ascend, ascend-a3, musa, maca{RESET}
+Example:
+  {BOLD}export PLATFORM=cuda{RESET}    # For CUDA platform
+{YELLOW}In CI scenarios only, you don't need to specify PLATFORM. If it's not a CI scenario, please uninstall and then reinstall with PLATFORM specified.{RESET}
+{RED}{'=' * 80}{RESET}
+"""
+        # Use write and flush to ensure output even without -v flag
+        sys.stderr.write(warning_msg)
+        sys.stderr.flush()
+
+
+if not PLATFORM:
+    atexit.register(print_platform_warning)
+
+
+def is_ascend() -> bool:
+    return PLATFORM is not None and PLATFORM.startswith("ascend")
+
+
+def enable_sparse() -> bool:
+    return ENABLE_SPARSE is not None and ENABLE_SPARSE.lower() == "true"
+
+
+def is_only_build_mode() -> bool:
+    return "bdist_wheel" in sys.argv
+
+
+def is_editable_mode() -> bool:
+    commands = [arg.lower() for arg in sys.argv]
+    return (
+        "develop" in commands
+        or "--editable" in commands
+        or "-e" in commands
+        or "editable_wheel" in commands
+    )
+
+
+class CMakeExtension(Extension):
+    def __init__(self, name: str, source_dir: str = ""):
+        super().__init__(name, sources=[])
+        self.cmake_file_path = os.path.abspath(source_dir)
+
+
+class CMakeBuild(build_ext):
+    def run(self):
+        cmake_exts = [ext for ext in self.extensions if isinstance(ext, CMakeExtension)]
+        other_exts = [
+            ext for ext in self.extensions if not isinstance(ext, CMakeExtension)
+        ]
+
+        build_dir = os.path.abspath(self.build_temp)
+        os.makedirs(build_dir, exist_ok=True)
+
+        for ext in cmake_exts:
+            self.build_cmake(ext)
+
+        if other_exts:
+            original_exts = self.extensions
+            try:
+                self.extensions = other_exts
+                super().run()
+            finally:
+                self.extensions = original_exts
+
+        if enable_sparse() and is_ascend():
+            gsa_build_script = "ucm/sparse/gsa_on_device/csrc/ascend/build.sh"
+            args = []
+            if PLATFORM == "ascend-a3":
+                args.append("a3")
+            if not is_only_build_mode():
+                args.append("install")
+            try:
+                print(
+                    f"Running {gsa_build_script} to compiling NPU custom ops for UCM..."
+                )
+                subprocess.check_call(["bash", gsa_build_script] + args)
+                print(f"{gsa_build_script} executed successfully!")
+            except subprocess.CalledProcessError as e:
+                print("Error running {gsa_build_script}: {e}")
+                raise SystemExit(e.returncode)
+
+    def build_cmake(self, ext: CMakeExtension):
+        build_dir = os.path.abspath(self.build_temp)
+        install_dir = os.path.abspath(self.build_lib)
+        if is_editable_mode():
+            install_dir = ext.cmake_file_path
+
+        cmake_args = [
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPython_INCLUDE_DIR={sysconfig.get_path('include')}",
+            f"-DPython_ROOT_DIR={sys.prefix}",
+            f"-DCMAKE_INSTALL_PREFIX={install_dir}",
+        ]
+
+        if ENABLE_MINDIE:
+            cmake_args += ["-DBUILD_UCM_MINDIE=ON"]
+            cmake_args += [f"-DUCM_CXX11_ABI={UCM_CXX11_ABI}"]
+
+        if enable_sparse():
+            cmake_args += ["-DBUILD_UCM_SPARSE=ON"]
+
+        if BUILD_UCM_ASU:
+            cmake_args += ["-DBUILD_UCM_ASU=ON"]
+        if BUILD_KV_CLIENT_PROVIDER_AIV:
+            cmake_args += ["-DBUILD_KV_CLIENT_PROVIDER_AIV=ON"]
+        if BUILD_KV_CLIENT_PROVIDER_AICPU:
+            cmake_args += ["-DBUILD_KV_CLIENT_PROVIDER_AICPU=ON"]
+
+        if ENABLE_GDR:
+            cmake_args += ["-DUCM_ENABLE_GDR_STREAM=ON"]
+
+        if ASCEND_ROOT:
+            cmake_args += [f"-DASCEND_ROOT={ASCEND_ROOT}"]
+
+        build_cpu_arch = os.getenv("UCM_BUILD_CPU_ARCH")
+        if is_ascend() and build_cpu_arch:
+            ascend_subdirectory = {
+                "amd64": "x86_64-linux",
+                "arm64": "aarch64-linux",
+            }.get(build_cpu_arch)
+            if ascend_subdirectory is None:
+                raise RuntimeError(
+                    f"unsupported build CPU architecture: {build_cpu_arch}"
+                )
+            cmake_args += [
+                "-DASCEND_ARCH_DIR="
+                f"/usr/local/Ascend/ascend-toolkit/latest/{ascend_subdirectory}"
+            ]
+
+        match PLATFORM:
+            case "cuda":
+                cmake_args += ["-DRUNTIME_ENVIRONMENT=cuda"]
+            case "ascend":
+                cmake_args += ["-DRUNTIME_ENVIRONMENT=ascend"]
+            case "ascend-a3":
+                cmake_args += ["-DRUNTIME_ENVIRONMENT=ascend-a3"]
+            case "musa":
+                cmake_args += ["-DRUNTIME_ENVIRONMENT=musa"]
+            case "maca":
+                cmake_args += ["-DRUNTIME_ENVIRONMENT=maca"]
+                cmake_args += ["-DBUILD_UCM_SPARSE=OFF"]
+            case _:
+                cmake_args += ["-DRUNTIME_ENVIRONMENT=simu"]
+                cmake_args += ["-DBUILD_UCM_SPARSE=OFF"]
+
+        subprocess.check_call(
+            ["cmake", *cmake_args, ext.cmake_file_path], cwd=build_dir
+        )
+        subprocess.check_call(
+            ["cmake", "--build", ".", "--config", "Release", "--", "-j8"],
+            cwd=build_dir,
+        )
+
+        subprocess.check_call(
+            ["cmake", "--install", ".", "--config", "Release", "--component", "ucm"],
+            cwd=build_dir,
+        )
+
+
+def inject_pth():
+    if not ("-e" in sys.argv or "develop" in sys.argv or "editable_wheel" in sys.argv):
+        return
+
+    import site
+
+    pth_name = "ucm_patch.pth"
+    source = os.path.abspath(pth_name)
+
+    if not os.path.exists(source):
+        print(f"Error: {pth_name} not found in root directory.")
+        return
+
+    try:
+        try:
+            site_packages = site.getsitepackages()[0]
+        except AttributeError:
+            from distutils.sysconfig import get_python_lib
+
+            site_packages = get_python_lib()
+
+        target = os.path.join(site_packages, pth_name)
+
+        if not os.path.exists(target):
+            if sys.platform == "win32":
+                import shutil
+
+                shutil.copy(source, target)
+            else:
+                os.symlink(source, target)
+            print("Injection successful.")
+
+    except Exception as e:
+        print(f"\033[93mWarning: Failed to inject .pth for editable mode: {e}\033[0m")
+
+
+setup(
+    name="uc-manager",
+    version=get_package_version(),
+    description="Unified Cache Management",
+    author="Unified Cache Team",
+    packages=[
+        pkg
+        for pkg in (find_packages() + [""])
+        if ENABLE_MINDIE or not pkg.startswith("ucm.integration.mindie")
+    ],
+    package_dir={"": "."},
+    python_requires=">=3.10",
+    ext_modules=[CMakeExtension(name="ucm", source_dir=ROOT_DIR)],
+    cmdclass={"build_ext": CMakeBuild},
+    zip_safe=False,
+    include_package_data=False,
+    package_data={
+        "ucm": ["sparse/gsa_on_device/configs/**/*.json"],
+        **({"ucm.integration.mindie": ["ucm_config.json"]} if ENABLE_MINDIE else {}),
+        "": [
+            "ucm_patch.pth",
+        ],
+    },
+)
+if any(arg in sys.argv for arg in ["-e", "develop", "editable_wheel"]):
+    inject_pth()

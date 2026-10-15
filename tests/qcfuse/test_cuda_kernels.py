@@ -11,6 +11,380 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_compact_projection_values_preserve_normalized_qkv(batch):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    head_dim, q_heads, kv_heads = 128, 8, 1
+    q_size, kv_size = head_dim * q_heads, head_dim * kv_heads
+    fused = torch.randn(
+        batch * 17, q_size + 2 * kv_size, device="cuda", dtype=torch.bfloat16
+    )
+    with set_current_vllm_config(VllmConfig()):
+        q_norm = RMSNorm(head_dim, eps=1e-6).cuda().to(torch.bfloat16)
+        k_norm = RMSNorm(head_dim, eps=1e-6).cuda().to(torch.bfloat16)
+    q, k, v = fused.split([q_size, kv_size, kv_size], dim=-1)
+    expected_q = q_norm(q.view(-1, q_heads, head_dim)).view(q.shape)
+    expected_k = k_norm(k.view(-1, kv_heads, head_dim)).view(k.shape)
+    expected_v = v.clone()
+    compact_v = v.clone()
+    compact_q = q_norm(q.view(-1, q_heads, head_dim)).view(q.shape)
+    compact_k = k_norm(k.view(-1, kv_heads, head_dim)).view(k.shape)
+    original_pointer = fused.untyped_storage().data_ptr()
+    assert all(
+        t.untyped_storage().data_ptr() != original_pointer
+        for t in (compact_q, compact_k, compact_v)
+    )
+    assert (
+        compact_v.untyped_storage().nbytes()
+        == compact_v.numel() * compact_v.element_size()
+    )
+    for actual, expected in zip(
+        (compact_q, compact_k, compact_v), (expected_q, expected_k, expected_v)
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.fixture(autouse=True)
+def _delete_generated_test_kv(request):
+    yield
+    directory = request.node.funcargs.get("tmp_path")
+    if directory is not None:
+        for path in directory.rglob("*.bin"):
+            if not path.is_symlink():
+                path.unlink()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_compact_native_silu_and_full_gemm_are_bit_exact(batch):
+    from types import SimpleNamespace
+    from ucm.integration.vllm.latest_sparse import (
+        _compact_silu_and_mul,
+        _compact_qwen_mlp_forward,
+    )
+
+    # Actual Qwen3-32B FFN dimensions, uneven tile ends and several requests.
+    tokens, hidden, intermediate = batch * 513, 5120, 25600
+    gate = torch.randn(tokens, intermediate * 2, device="cuda", dtype=torch.bfloat16)
+    expected_activation = gate.new_empty((tokens, intermediate))
+    torch.ops._C.silu_and_mul(expected_activation, gate)
+    actual_activation = _compact_silu_and_mul(gate, torch.ops._C.silu_and_mul)
+    assert (
+        actual_activation.untyped_storage().data_ptr()
+        == gate.untyped_storage().data_ptr()
+    )
+    torch.testing.assert_close(actual_activation, expected_activation, rtol=0, atol=0)
+    del gate, actual_activation, expected_activation
+
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    up_weight = (
+        torch.randn(intermediate * 2, hidden, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    )
+    down_weight = (
+        torch.randn(hidden, intermediate, device="cuda", dtype=torch.bfloat16) * 0.01
+    )
+    up = torch.nn.functional.linear(x, up_weight)
+    activated = up.new_empty((tokens, intermediate))
+    torch.ops._C.silu_and_mul(activated, up)
+    expected = torch.nn.functional.linear(activated, down_weight)
+    del up, activated
+    mlp = SimpleNamespace(
+        gate_up_proj=lambda t: (torch.nn.functional.linear(t, up_weight), None),
+        act_fn=SimpleNamespace(op=torch.ops._C.silu_and_mul),
+        down_proj=SimpleNamespace(weight=down_weight),
+    )
+    actual = _compact_qwen_mlp_forward(mlp, x)
+    assert actual is x
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_transfer_event_orders_a_different_consumer_stream():
+    from ucm.store.qcfuse.transfer import _attach_ready_event, wait_on_current_stream
+
+    producer = torch.cuda.Stream()
+    consumer = torch.cuda.Stream()
+    tensors = torch.empty(1024, device="cuda"), torch.empty(1024, device="cuda")
+    producer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(producer):
+        torch.cuda._sleep(10_000_000)
+        tensors[0].fill_(17)
+        tensors[1].fill_(23)
+        ready = torch.cuda.Event()
+        ready.record(producer)
+    _attach_ready_event(tensors, ready)
+    with torch.cuda.stream(consumer):
+        wait_on_current_stream(tensors)
+        copied = tensors[0] + tensors[1]
+    consumer.synchronize()
+    torch.testing.assert_close(copied, torch.full_like(copied, 40), rtol=0, atol=0)
+
+
+def test_native_vllm_rope_reuse_preserves_key_bits_for_mixed_lengths():
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from ucm.sparse.qcfuse.blender import _rotate_key
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    with set_current_vllm_config(VllmConfig()):
+        rotary = get_rope(head_size=32, max_position=128, dtype=torch.bfloat16).cuda()
+        pointers = []
+        for length in (3, 7, 4, 5):
+            key = torch.randn(length, 64, device="cuda", dtype=torch.bfloat16)
+            positions = torch.arange(length, device="cuda")
+            _, expected = rotary(positions, torch.empty_like(key), key.clone())
+            actual = _rotate_key(rotary, positions, key.clone())
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            pointers.append(rotary._cached_fake_q.data_ptr())
+        assert pointers[1] == pointers[2] == pointers[3]
+
+
+@pytest.mark.parametrize("mode", ["ssd", "cpu", "gpu"])
+def test_actual_cache_load_is_ready_on_another_thread_stream(tmp_path, mode):
+    from concurrent.futures import ThreadPoolExecutor
+    from ucm.store.qcfuse import transfer, packed_format as pf
+
+    key = torch.full((8192, 1, 32), 17, dtype=torch.bfloat16)
+    value = torch.full_like(key, 23)
+    pf.save_packed_kv(str(tmp_path), {0: (key, value)}, 1)
+    meta = pf.load_packed_meta(str(tmp_path))
+    kind = f"cuda_test:{mode}"
+    if mode != "ssd":
+        transfer.preload_resident_file(str(tmp_path / "kv_packed.bin"), mode)
+    pool = transfer.get_transfer_pool(kind, "cuda:0")
+    producer = torch.cuda.Stream()
+    consumer = torch.cuda.Stream()
+    try:
+
+        def load():
+            with torch.cuda.stream(producer):
+                torch.cuda._sleep(10_000_000)
+                delay = torch.cuda.Event()
+                delay.record(producer)
+                pool.stream.wait_event(delay)
+                return transfer.load_packed_layer(
+                    str(tmp_path), meta, 0, "cuda:0", kind=kind, wait=False
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            tensors = executor.submit(load).result()
+        with torch.cuda.stream(consumer):
+            transfer.wait_on_current_stream(tensors)
+            result = tensors[0] + tensors[1]
+        consumer.synchronize()
+        torch.testing.assert_close(result.cpu(), key + value, rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        transfer.release_transfer_pools(kind)
+        transfer.release_resident_files()
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_resident_pin_failure_keeps_bytes_off_ssd(tmp_path, monkeypatch, registered):
+    from ucm.store.qcfuse import transfer, packed_format as pf
+
+    key = torch.full((4096, 1, 32), 17, dtype=torch.bfloat16)
+    value = torch.full_like(key, 23)
+    pf.save_packed_kv(
+        str(tmp_path), {layer: (key + layer, value) for layer in range(3)}, 3
+    )
+    meta = pf.load_packed_meta(str(tmp_path))
+    original_empty = torch.empty
+    failed_once = False
+
+    def fail_first_pin(*args, **kwargs):
+        nonlocal failed_once
+        if kwargs.get("pin_memory") and not failed_once:
+            failed_once = True
+            raise RuntimeError("Forced whole-resident pin allocation failure")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_first_pin)
+    if not registered:
+        monkeypatch.setattr(transfer, "_try_register_host_memory", lambda tensor: False)
+    path = tmp_path / "kv_packed.bin"
+    kind = f"resident_fallback:{registered}"
+    try:
+        transfer.preload_resident_file(str(path), "cpu")
+        resident = transfer.resident_reader(str(path))
+        assert failed_once and resident is not None
+        if registered and not resident.registered:
+            pytest.skip(
+                "Host registration unavailable; pageable fallback tested separately"
+            )
+        assert resident.registered == registered
+        assert resident.pinned == registered
+        # Unlink alone leaves existing fds and mappings readable. Change the
+        # backing bytes first so a file-backed fallback cannot silently pass.
+        with path.open("r+b", buffering=0) as stream:
+            stream.write(bytes(path.stat().st_size))
+        path.unlink()
+        consumer = torch.cuda.Stream()
+        for layer in range(3):
+            tensors = transfer.load_packed_layer(
+                str(tmp_path), meta, layer, "cuda:0", kind=kind, wait=False
+            )
+            with torch.cuda.stream(consumer):
+                transfer.wait_on_current_stream(tensors)
+                actual_key = tensors[0].clone()
+                actual_value = tensors[1].clone()
+            consumer.synchronize()
+            assert torch.equal(
+                actual_key.cpu().view(torch.uint8), (key + layer).view(torch.uint8)
+            )
+            assert torch.equal(
+                actual_value.cpu().view(torch.uint8), value.view(torch.uint8)
+            )
+        metrics = transfer.get_transfer_pool(kind, "cuda:0").drain_metrics()
+        assert metrics["ssd_read_bytes"] == 0
+        if registered:
+            assert metrics["resident_cpu_direct_layers"] == 3
+        else:
+            assert (
+                metrics["resident_read_bytes"] == key.numel() * key.element_size() * 6
+            )
+    finally:
+        torch.cuda.synchronize()
+        transfer.release_transfer_pools(kind)
+        transfer.release_resident_files()
+
+
+def test_failed_host_registration_does_not_poison_next_cuda_kernel():
+    from types import SimpleNamespace
+    from ucm.store.qcfuse.transfer import _try_register_host_memory
+
+    torch.cuda.init()
+    invalid_host_pointer = SimpleNamespace(numel=lambda: 1, data_ptr=lambda: 0)
+    assert _try_register_host_memory(invalid_host_pointer) is False
+    result = torch.empty(8, device="cuda")
+    result.fill_(7)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(result, torch.full_like(result, 7), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_failed_pinned_staging_falls_back_with_exact_cache_bytes(
+    tmp_path, monkeypatch, batch
+):
+    from ucm.store.qcfuse import transfer, packed_format as pf
+
+    key = torch.full((512, 1, 32), 17, dtype=torch.bfloat16)
+    value = torch.full_like(key, 23)
+    pf.save_packed_kv(str(tmp_path), {i: (key + i, value) for i in range(3)}, 3)
+    meta = pf.load_packed_meta(str(tmp_path))
+    original_empty = torch.empty
+
+    def fail_pinning(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            # Leave a real handled CUDA last-error, then inject the observed
+            # allocator failure without exhausting machine-wide host memory.
+            status = torch.cuda.cudart().cudaHostRegister(0, 1, 0)
+            assert int(status[0] if isinstance(status, (tuple, list)) else status) != 0
+            raise RuntimeError("CUDA error: invalid argument from cuMemHostAlloc")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_pinning)
+    kind = f"pageable_staging_test:{batch}"
+    consumer = torch.cuda.Stream()
+    try:
+        for _ in range(batch):
+            for layer in range(3):
+                with torch.cuda.stream(consumer):
+                    tensors = transfer.load_packed_layer(
+                        str(tmp_path), meta, layer, "cuda:0", kind=kind
+                    )
+                    copied = (tensors[0].clone(), tensors[1].clone())
+                consumer.synchronize()
+                torch.testing.assert_close(copied[0].cpu(), key + layer, rtol=0, atol=0)
+                torch.testing.assert_close(copied[1].cpu(), value, rtol=0, atol=0)
+        pool = transfer.get_transfer_pool(kind, "cuda:0")
+        assert pool.drain_metrics()["pinned_allocation_fallbacks"] > 0
+        assert pool.last_operation_metrics()["pageable_staging"] == 1.0
+        # A later ordinary CUDA operation must remain healthy.
+        healthy = torch.zeros(8, device="cuda") + 7
+        torch.cuda.synchronize()
+        torch.testing.assert_close(healthy, torch.full_like(healthy, 7), rtol=0, atol=0)
+    finally:
+        torch.cuda.synchronize()
+        transfer.release_transfer_pools(kind)
+
+
+def test_cpu_offline_stash_preserves_gpu_cache_bytes(tmp_path):
+    from ucm.sparse.qcfuse.blend_info import BlendStyle, QcFuseRequestState
+    from ucm.store.qcfuse.packed_format import save_packed_kv
+
+    fused = torch.arange(120, device="cuda", dtype=torch.bfloat16).reshape(3, 40)
+    _, key, value = fused.split([32, 4, 4], dim=-1)
+    gpu = QcFuseRequestState(blend_style=BlendStyle.KVCOMPUTE)
+    cpu = QcFuseRequestState(blend_style=BlendStyle.KVCOMPUTE, offline_kv_device="cpu")
+    gpu.put_kv(key, value, 0)
+    cpu.put_kv(key, value, 0)
+    torch.testing.assert_close(cpu.get_kv(0)[0], gpu.get_kv(0)[0].cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(cpu.get_kv(0)[1], gpu.get_kv(0)[1].cpu(), rtol=0, atol=0)
+    indices = torch.tensor([0, 2], device="cuda")
+    save_packed_kv(str(tmp_path / "gpu"), {0: gpu.get_kv(0)}, 1, token_indices=indices)
+    save_packed_kv(str(tmp_path / "cpu"), {0: cpu.get_kv(0)}, 1, token_indices=indices)
+    assert (tmp_path / "gpu/kv_packed.bin").read_bytes() == (
+        tmp_path / "cpu/kv_packed.bin"
+    ).read_bytes()
+    assert (tmp_path / "gpu/kv_packed_meta.json").read_bytes() == (
+        tmp_path / "cpu/kv_packed_meta.json"
+    ).read_bytes()
+
+
+@pytest.mark.parametrize("group", [1, 2, 4])
+def test_grouped_pinned_reads_preserve_layers_when_ring_wraps(
+    tmp_path, monkeypatch, group
+):
+    import math
+    from ucm.store.qcfuse import transfer, packed_format as pf
+
+    monkeypatch.setenv("QCFUSE_IO_GROUP_LAYERS", str(group))
+    monkeypatch.setenv("QCFUSE_TRANSFER_RING_DEPTH", "2")
+    monkeypatch.setenv("QCFUSE_TRANSFER_RING_MAX_DEPTH", "2")
+    monkeypatch.setenv("QCFUSE_TRANSFER_TIMING", "1")
+    layers = {
+        layer: (
+            torch.full((128, 2, 32), layer, dtype=torch.bfloat16),
+            torch.full((128, 2, 32), layer + 100, dtype=torch.bfloat16),
+        )
+        for layer in range(7)
+    }
+    pf.save_packed_kv(str(tmp_path), layers, 7)
+    meta = pf.load_packed_meta(str(tmp_path))
+    kind = f"grouped_test:{group}"
+    pool = transfer.get_transfer_pool(kind, "cuda:0")
+    try:
+        with torch.cuda.stream(pool.stream):
+            torch.cuda._sleep(10_000_000)
+        loaded = [
+            transfer.load_packed_layer(
+                str(tmp_path), meta, layer, "cuda:0", kind=kind, wait=False
+            )
+            for layer in range(7)
+        ]
+        consumer = torch.cuda.Stream()
+        with torch.cuda.stream(consumer):
+            copies = [
+                (key.clone(), value.clone())
+                for key, value in (
+                    transfer.wait_on_current_stream(pair) for pair in loaded
+                )
+            ]
+        consumer.synchronize()
+        for layer, (key, value) in enumerate(copies):
+            torch.testing.assert_close(key.cpu(), layers[layer][0], rtol=0, atol=0)
+            torch.testing.assert_close(value.cpu(), layers[layer][1], rtol=0, atol=0)
+        metrics = pool.drain_metrics()
+        assert metrics["read_blocks"] == math.ceil(7 / group)
+        assert metrics["completed_copies"] == 7
+        assert metrics["ssd_read_bytes"] == (tmp_path / "kv_packed.bin").stat().st_size
+    finally:
+        torch.cuda.synchronize()
+        transfer.release_transfer_pools(kind)
+
+
 def test_attention_importance_matches_query_head_layer_mean():
     from ucm.sparse.qcfuse.triton_attention_score import (
         compute_att_full_softmax_importance,
@@ -148,3 +522,118 @@ def test_ragged_attention_matches_torch_for_unequal_batches(batch_size):
 
     expected = torch.cat(expected_parts).to(output.dtype)
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-3)
+
+
+def test_failed_resident_gpu_batch_releases_partial_allocation_and_can_retry(
+    tmp_path, monkeypatch
+):
+    from ucm.store.qcfuse import transfer
+
+    first = tmp_path / "first.bin"
+    second = tmp_path / "second.bin"
+    first.write_bytes(bytes(range(32)))
+    second.write_bytes(bytes(range(64)))
+    transfer.release_resident_files()
+    torch.cuda.synchronize()
+    initial_allocated = torch.cuda.memory_allocated()
+    original_to = torch.Tensor.to
+
+    def fail_second_copy(tensor, *args, **kwargs):
+        if (
+            tensor.device.type == "cpu"
+            and tensor.numel() == 64
+            and kwargs.get("device") == "cuda:0"
+        ):
+            raise RuntimeError("Injected CUDA out of memory during resident preload")
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", fail_second_copy)
+    try:
+        with pytest.raises(RuntimeError, match="Injected CUDA out of memory"):
+            transfer.prepare_resident_batch(None, [str(first), str(second)], "gpu")
+        torch.cuda.synchronize()
+        assert transfer.resident_metrics()["resident_files"] == 0
+        assert transfer.resident_metrics()["resident_gpu_bytes"] == 0
+        assert torch.cuda.memory_allocated() == initial_allocated
+
+        retried = transfer.prepare_resident_batch(None, [str(first)], "gpu")
+        assert retried["resident_files"] == 1
+        assert retried["resident_gpu_bytes"] == 32
+        assert not retried["resident_batch_reused"]
+        reader = transfer.resident_reader(str(first))
+        assert bytes(reader.tensor.cpu().tolist()) == first.read_bytes()
+    finally:
+        transfer.release_resident_files()
+
+
+def test_gpu_headroom_failure_rolls_back_before_online_submission(
+    tmp_path, monkeypatch
+):
+    from ucm.store.qcfuse import transfer
+
+    path = tmp_path / "headroom.bin"
+    path.write_bytes(bytes(range(32)))
+    transfer.release_resident_files()
+    torch.cuda.synchronize()
+    initial = torch.cuda.memory_allocated()
+    original_empty = torch.empty
+    probe_bytes = 4 * 1024**2
+
+    def fail_probe(*args, **kwargs):
+        if args == (probe_bytes,) and kwargs.get("dtype") == torch.uint8:
+            raise RuntimeError("Injected CUDA out of memory probing online headroom")
+        return original_empty(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", fail_probe)
+            with pytest.raises(RuntimeError, match="probing online headroom"):
+                transfer.prepare_resident_batch(None, [str(path)], "gpu", probe_bytes)
+        torch.cuda.synchronize()
+        assert transfer.resident_metrics()["resident_files"] == 0
+        assert torch.cuda.memory_allocated() == initial
+        result = transfer.prepare_resident_batch(None, [str(path)], "gpu", probe_bytes)
+        assert result["online_headroom_bytes"] == probe_bytes
+        assert result["resident_files"] == 1
+        result = transfer.prepare_resident_batch(None, [str(path)], "gpu", probe_bytes)
+        assert result["resident_batch_reused"]
+        assert torch.equal(
+            transfer.resident_reader(str(path)).tensor.cpu(),
+            torch.arange(32, dtype=torch.uint8),
+        )
+    finally:
+        transfer.release_resident_files()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_gpu_resident_lazy_load_keeps_source_bytes_immutable(tmp_path, batch):
+    from types import SimpleNamespace
+    from ucm.store.qcfuse import transfer, packed_format as pf
+    from ucm.store.qcfuse.qcfuse_store import UcmQcFuseStore
+
+    key = torch.full((512, 1, 32), 17, dtype=torch.bfloat16)
+    value = torch.full_like(key, 23)
+    pf.save_packed_kv(str(tmp_path), {i: (key, value) for i in range(3)}, 3)
+    path = str(tmp_path / "kv_packed.bin")
+    transfer.prepare_resident_batch(None, [path], "gpu")
+    store = UcmQcFuseStore({"storage_mode": "gpu", "resident_preload_policy": "batch"})
+    original = transfer.resident_reader(path).tensor.clone()
+    consumer = torch.cuda.Stream()
+    try:
+        store.begin_requests([SimpleNamespace(request_id=str(i)) for i in range(batch)])
+        assert not store._tasks
+        for _request in range(batch):
+            with torch.cuda.stream(consumer):
+                loaded_k, loaded_v = store.load_chunk_layer(str(tmp_path), 1)
+                loaded_k.fill_(99)
+                loaded_v.zero_()
+                fresh_k, fresh_v = store.load_chunk_layer(str(tmp_path), 1)
+            consumer.synchronize()
+            torch.testing.assert_close(fresh_k.cpu(), key, rtol=0, atol=0)
+            torch.testing.assert_close(fresh_v.cpu(), value, rtol=0, atol=0)
+            assert torch.equal(transfer.resident_reader(path).tensor, original)
+    finally:
+        torch.cuda.synchronize()
+        store.close()
+        transfer.release_transfer_pools("")
+        transfer.release_resident_files()

@@ -1,0 +1,430 @@
+import os
+import re
+from pathlib import Path
+from typing import List
+
+import pytest
+import yaml
+from common.common_inference_utils import (
+    ensure_storage_dir,
+    extract_answers,
+    get_platform_specific_module,
+    load_prompt_from_file,
+    load_prompt_list_from_file,
+    match_any_answer,
+    match_sparse_answer,
+    serialize_sample_params,
+    split_prompt_by_tokens,
+)
+from common.offline_inference_utils import (
+    run_in_spawn_subprocess,
+    run_offline_inference,
+)
+from common.path_utils import get_path_relative_to_test_root, get_path_to_model
+
+
+class TestBasicOfflineInferenceSparse:
+    """Test basic offline inference functionality."""
+
+    @pytest.mark.skip(reason="covered by online test")
+    @pytest.mark.stage(1)
+    @pytest.mark.feature("offline_inference_sparse")
+    @pytest.mark.gpu_mem(6000)
+    @pytest.mark.parametrize("model_name", ["Qwen2.5-1.5B-Instruct"])
+    @pytest.mark.parametrize("max_tokens", [200])
+    @pytest.mark.parametrize("prompt_split_ratio", [0.5])  # Split prompt in half
+    @pytest.mark.parametrize("enforce_eager", [True, False])
+    @pytest.mark.parametrize("max_num_batched_tokens", [2047])
+    def test_offline_accuracy_hbm_ssd_mixed_nosparse(
+        self,
+        model_name: str,
+        max_tokens: int,
+        prompt_split_ratio: float,
+        enforce_eager: bool,
+        max_num_batched_tokens: int,
+    ):
+        """Test HBM + SSD mixed hit accuracy (Phase 2).
+        This test first runs Phase 1 to generate a baseline output, then tests Phase 2.
+        Test flow:
+        1. Phase 1: Disable HBM PC, send full prompt -> KV cache saved to SSD (baseline)
+        2. Phase 2: Enable HBM PC, send partial prompt (warm HBM), then send full prompt (hits both HBM and SSD) -> verify mixed hit accuracy
+        The prompt is loaded from prompt.json file (LongBench format).
+        Args:
+            model_name: Name of the model.
+            max_tokens: Maximum tokens to generate.
+            prompt_split_ratio: Ratio to split prompt for Phase 2 (0.5 = split in half).
+        """
+        config_file = get_path_relative_to_test_root("config.yaml")
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        model_path = get_path_to_model(model_name, config)
+
+        assert os.path.exists(model_path), f"Model path does not exist: {model_path}"
+
+        ucm_storage_dir = "/tmp/ucm_cache"
+
+        # make sure UCM storage directory exists and is empty
+        ensure_storage_dir(ucm_storage_dir, clear_existing=True)
+
+        try:
+            test_prompt, standard_answers = load_prompt_from_file(
+                Path(__file__).parent / "prompts" / "test_offline_inference.json"
+            )
+            print(f"Loaded prompt from prompt.json (length: {len(test_prompt)} chars)")
+            if standard_answers:
+                print(f"Standard answers: {standard_answers}")
+            else:
+                pytest.fail(f"No standard answers found in prompt.json")
+        except Exception as e:
+            pytest.fail(f"Failed to load prompt from prompt.json: {e}")
+
+        tokenizer = get_platform_specific_module().AutoTokenizer.from_pretrained(
+            model_path, use_chat_template=True
+        )
+
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "先读问题，再根据下面的文章内容回答问题，不要进行分析，不要重复问题，用简短的语句给出答案。\n\n例如：“全国美国文学研究会的第十八届年会在哪所大学举办的？”\n回答应该为：“xx大学”。\n\n",
+                },
+                {"role": "user", "content": test_prompt},
+            ]
+            formatted_full_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                add_special_tokens=True,
+            )
+        except Exception:
+            formatted_full_prompt = test_prompt
+
+        prompt_first_part, prompt_second_part = split_prompt_by_tokens(
+            formatted_full_prompt, tokenizer, split_ratio=prompt_split_ratio
+        )
+
+        ucm_config = {
+            "ucm_connectors": [
+                {
+                    "ucm_connector_name": "UcmNfsStore",
+                    "ucm_connector_config": {
+                        "storage_backends": ucm_storage_dir,
+                        "use_direct": False,
+                    },
+                }
+            ],
+        }
+
+        sampling_params = get_platform_specific_module().SamplingParams(
+            temperature=0.0,
+            top_p=1,
+            max_tokens=max_tokens,
+            ignore_eos=False,
+        )
+
+        print(f"\n===== HBM + SSD Mixed Accuracy Test =====")
+        print(f"Model: {model_path}")
+        print(f"Full prompt length: {len(test_prompt)} chars")
+        print(f"Max tokens: {max_tokens}")
+        print(f"Temperature: 0.0 (deterministic)")
+        print(f"UCM storage: {ucm_storage_dir}")
+        print(f"Prompt split ratio: {prompt_split_ratio}")
+        print(f"Enforce eager: {enforce_eager}")
+        print(f"Max num batched tokens: {max_num_batched_tokens}")
+
+        # ===== Phase 1: Disable HBM PC, save KV cache to SSD and load (baseline) =====
+        # Run Phase 1 in a separate subprocess to ensure GPU memory is fully released
+        print(f"\n===== Phase 1: Save KV Cache to SSD And Load (Baseline) =====")
+
+        # Convert SamplingParams to dict for serialization, as non-picklable objects cannot be passed to subprocess
+        sampling_params_dict = serialize_sample_params(sampling_params)
+
+        phase1_outputs = run_in_spawn_subprocess(
+            run_offline_inference,
+            model_path,
+            ucm_config,
+            [formatted_full_prompt, formatted_full_prompt],
+            sampling_params_dict,
+            False,  # enable_prefix_caching=False for Phase 1
+            enforce_eager,
+            "Phase 1 (SSD save and load)",
+            max_num_batched_tokens,
+            timeout=180,
+        )
+        phase1_1_output = phase1_outputs[0]  # Phase 1.1: SSD save
+        phase1_2_output = phase1_outputs[1]  # Phase 1.2: SSD load
+        print(f"Phase 1 completed in subprocess")
+        print(f'Phase 1.1 output: "{phase1_1_output}"')
+        print(f'Phase 1.2 output: "{phase1_2_output}"')
+
+        # ===== Phase 2: Enable HBM PC, test HBM + SSD mixed hit =====
+        # Run Phase 2 in a separate subprocess to ensure GPU memory is fully released
+        print(f"\n===== Phase 2: HBM + SSD Mixed Hit Test =====")
+
+        phase2_outputs = run_in_spawn_subprocess(
+            run_offline_inference,
+            model_path,
+            ucm_config,
+            [prompt_first_part, formatted_full_prompt],
+            sampling_params_dict,
+            True,  # enable_prefix_caching=True for Phase 2
+            enforce_eager,
+            "Phase 2 (HBM + SSD mixed)",
+            max_num_batched_tokens,
+            timeout=180,
+        )
+        phase2_partial_output = phase2_outputs[0]
+        phase2_full_output = phase2_outputs[1]
+        print(f"Phase 2 completed in subprocess")
+        print(f"[INFO] Phase 2.1 output: {phase2_partial_output}")
+        print(f"[INFO] Phase 2.2 output: {phase2_full_output}")
+
+        print(f"\n[INFO] ===== Accuracy Test Results =====")
+        # Compare Phase 1.1 vs Phase 1.2 (SSD load accuracy)
+        phase1_correct = match_any_answer(
+            phase1_1_output, standard_answers
+        ) and match_any_answer(phase1_2_output, standard_answers)
+        if not phase1_correct:
+            print(f"\n===== Phase 1: SSD Load Accuracy Test (Exact Match) =====")
+            print(
+                f"Incorrect answer in Phase 1.1 (SSD save) or Phase 1.2 (SSD load) output!"
+            )
+            print(f"Phase 1.1 output:\n{phase1_1_output}")
+            print(f"Phase 1.2 output:\n{phase1_2_output}")
+            print(f"Standard answers:\n{standard_answers}")
+            pytest.fail("SSD Load Accuracy Test Failed!")
+
+        # Phase 2.1 should be skipped from accuracy check since it's only partial prompt
+        phase2_correct = match_any_answer(phase2_full_output, standard_answers)
+        if not phase2_correct:
+            print(f"\n===== Phase 2: HBM + SSD Mixed Accuracy Test (Exact Match) =====")
+            print(f"Incorrect answer in Phase 2.2 (HBM + SSD mixed) output!")
+            print(f"Phase 2.2 output:\n{phase2_full_output}")
+            print(f"Standard answers:\n{standard_answers}")
+            pytest.fail("HBM + SSD Mixed Accuracy Test Failed!")
+
+    """Test GSA sparse attention."""
+
+    @pytest.mark.stage(1)
+    @pytest.mark.feature("offline_inference_sparse")
+    @pytest.mark.gpu_mem(70000)
+    @pytest.mark.parametrize("model_name", ["DeepSeek-V2-Lite-Chat"])
+    @pytest.mark.parametrize("max_tokens", [16])
+    @pytest.mark.parametrize("enforce_eager", [False])
+    @pytest.mark.parametrize("max_num_batched_tokens", [30000])
+    def test_offline_gsa_mla(
+        self,
+        model_name: str,
+        max_tokens: int,
+        enforce_eager: bool,
+        max_num_batched_tokens: int,
+    ):
+        os.environ["ENABLE_SPARSE"] = "1"
+        os.environ["VLLM_HASH_ATTENTION"] = "1"
+
+        config_file = get_path_relative_to_test_root("config.yaml")
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        model_path = get_path_to_model(model_name, config)
+
+        assert os.path.exists(model_path), f"Model path does not exist: {model_path}"
+
+        try:
+            test_prompts, standard_answers = load_prompt_list_from_file(
+                get_path_relative_to_test_root(
+                    "suites/E2E/prompts/test_offline_gsaondevice_inference.json"
+                )
+            )
+            if not standard_answers:
+                pytest.fail(f"No standard answers found in prompt.json")
+        except Exception as e:
+            pytest.fail(f"Failed to load prompt from prompt.json: {e}")
+
+        print(f"Standard answers: {standard_answers}")
+
+        tokenizer = get_platform_specific_module().AutoTokenizer.from_pretrained(
+            model_path, use_chat_template=True
+        )
+        formatted_full_prompts = []
+        for i in range(len(test_prompts)):
+            test_prompt = test_prompts[i]
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "先读问题，再根据下面的文章内容回答问题，不要进行分析，不要重复问题，用简短的语句给出答案。\n\n例如：“全国美国文学研究会的第十八届年会在哪所大学举办的？”\n回答应该为：“xx大学”。\n\n",
+                    },
+                    {"role": "user", "content": test_prompt},
+                ]
+                formatted_full_prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    add_special_tokens=True,
+                )
+            except Exception:
+                formatted_full_prompt = test_prompt
+            formatted_full_prompts.append(formatted_full_prompt)
+
+        ucm_config = {
+            "ucm_connectors": [
+                {
+                    "ucm_connector_name": "UcmPipelineStore",
+                    "ucm_connector_config": {
+                        "store_pipeline": "Empty",
+                        "share_buffer_enable": True,
+                    },
+                }
+            ],
+            "ucm_sparse_config": {"GSAOnDevice": {}},
+        }
+
+        sampling_params = get_platform_specific_module().SamplingParams(
+            temperature=0.0,
+            top_p=1,
+            max_tokens=max_tokens,
+            ignore_eos=False,
+        )
+
+        # Convert SamplingParams to dict for serialization, as non-picklable objects cannot be passed to subprocess
+        sampling_params_dict = serialize_sample_params(sampling_params)
+        phase_sparse_output = run_in_spawn_subprocess(
+            run_offline_inference,
+            model_path,
+            ucm_config,
+            formatted_full_prompts,
+            sampling_params_dict,
+            False,  # enable_prefix_caching=False
+            enforce_eager,
+            "GSA",
+            max_num_batched_tokens,
+            timeout=1800,
+        )
+
+        print(
+            f" GsaOnDevice inference for a MLA-based model is completed in a subprocess."
+        )
+        print(f'GsaOnDevice output: "{phase_sparse_output}"')
+        print(f'Standard answers: "{standard_answers}"')
+        phase_sparse_correct = match_sparse_answer(
+            phase_sparse_output, standard_answers
+        )
+        if not phase_sparse_correct:
+            print(f"Incorrect answer in GsaOnDevice inference output[MLA]!")
+            print(f"GsaOnDevice output:\n{phase_sparse_output}")
+            print(f"Standard answers:\n{standard_answers}")
+            pytest.fail("GsaOnDevice Test Failed!")
+
+    @pytest.mark.stage(1)
+    @pytest.mark.feature("offline_inference_sparse")
+    @pytest.mark.gpu_mem(30000)
+    @pytest.mark.parametrize("model_name", ["Qwen3-4B"])
+    @pytest.mark.parametrize("max_tokens", [2048])
+    @pytest.mark.parametrize("enforce_eager", [False])
+    @pytest.mark.parametrize("max_num_batched_tokens", [30000])
+    def test_offline_gsa_gqa(
+        self,
+        model_name: str,
+        max_tokens: int,
+        enforce_eager: bool,
+        max_num_batched_tokens: int,
+    ):
+        os.environ["ENABLE_SPARSE"] = "1"
+        os.environ["VLLM_HASH_ATTENTION"] = "1"
+
+        config_file = get_path_relative_to_test_root("config.yaml")
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        model_path = get_path_to_model(model_name, config)
+
+        assert os.path.exists(model_path), f"Model path does not exist: {model_path}"
+
+        try:
+            test_prompts, standard_answers = load_prompt_list_from_file(
+                get_path_relative_to_test_root(
+                    "suites/E2E/prompts/test_offline_gsaondevice_inference.json"
+                )
+            )
+            if not standard_answers:
+                pytest.fail(f"No standard answers found in prompt.json")
+        except Exception as e:
+            pytest.fail(f"Failed to load prompt from prompt.json: {e}")
+
+        print(f"Standard answers: {standard_answers}")
+
+        tokenizer = get_platform_specific_module().AutoTokenizer.from_pretrained(
+            model_path, use_chat_template=True
+        )
+        formatted_full_prompts = []
+        for i in range(len(test_prompts)):
+            test_prompt = test_prompts[i]
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "先读问题，再根据下面的文章内容回答问题，不要进行分析，不要重复问题，用简短的语句给出答案。\n\n例如：“全国美国文学研究会的第十八届年会在哪所大学举办的？”\n回答应该为：“xx大学”。\n\n",
+                    },
+                    {"role": "user", "content": test_prompt},
+                ]
+                formatted_full_prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    add_special_tokens=True,
+                )
+            except Exception:
+                formatted_full_prompt = test_prompt
+            formatted_full_prompts.append(formatted_full_prompt)
+
+        ucm_config = {
+            "ucm_connectors": [
+                {
+                    "ucm_connector_name": "UcmPipelineStore",
+                    "ucm_connector_config": {
+                        "store_pipeline": "Empty",
+                        "share_buffer_enable": True,
+                    },
+                }
+            ],
+            "ucm_sparse_config": {"GSAOnDevice": {}},
+        }
+
+        sampling_params = get_platform_specific_module().SamplingParams(
+            temperature=0.0,
+            top_p=1,
+            max_tokens=max_tokens,
+            ignore_eos=False,
+        )
+
+        # Convert SamplingParams to dict for serialization, as non-picklable objects cannot be passed to subprocess
+        sampling_params_dict = serialize_sample_params(sampling_params)
+        phase_sparse_output = run_in_spawn_subprocess(
+            run_offline_inference,
+            model_path,
+            ucm_config,
+            formatted_full_prompts,
+            sampling_params_dict,
+            False,  # enable_prefix_caching=False
+            enforce_eager,
+            "GSA",
+            max_num_batched_tokens,
+            timeout=1800,
+        )
+
+        phase_sparse_output = extract_answers(phase_sparse_output)
+        print(
+            f" GsaOnDevice inference for a GQA-based model is completed in a subprocess."
+        )
+        print(f'GsaOnDevice output: "{phase_sparse_output}"')
+        print(f'Standard answers: "{standard_answers}"')
+        phase_sparse_correct = match_sparse_answer(
+            phase_sparse_output, standard_answers
+        )
+        if not phase_sparse_correct:
+            print(f"Incorrect answer in GsaOnDevice inference output[GQA]!")
+            print(f"GsaOnDevice output:\n{phase_sparse_output}")
+            print(f"Standard answers:\n{standard_answers}")
+            pytest.fail("GsaOnDevice Test Failed!")

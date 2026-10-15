@@ -1,0 +1,62 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ * */
+#include <pybind11/pybind11.h>
+#include "logger.h"
+
+namespace py = pybind11;
+namespace UC::Logger {
+
+void LogWrapper(Level lv, std::string file, std::string func, int line, std::string msg)
+{
+    Log(std::move(lv), std::move(file), std::move(func), line, std::move(msg));
+}
+
+void RateLimitLogWrapper(Level lv, std::string file, std::string func, int line, std::string msg)
+{
+    LogRateLimit(std::move(lv), std::move(file), std::move(func), line, std::move(msg));
+}
+
+void FileOnlyLogWrapper(Level lv, std::string file, std::string func, int line, std::string msg)
+{
+    LogFileOnly(std::move(lv), std::move(file), std::move(func), line, std::move(msg));
+}
+
+PYBIND11_MODULE(ucmlogger, m)
+{
+    m.def("setup", &Setup, py::call_guard<py::gil_scoped_release>());
+    m.def("flush", &Flush, py::call_guard<py::gil_scoped_release>());
+    m.def("log", &LogWrapper, py::call_guard<py::gil_scoped_release>());
+    m.def("log_rate_limit", &RateLimitLogWrapper, py::call_guard<py::gil_scoped_release>());
+    m.def("log_file_only", &FileOnlyLogWrapper, py::call_guard<py::gil_scoped_release>());
+    m.def("isEnabledFor", &isEnabledFor, py::call_guard<py::gil_scoped_release>());
+    py::enum_<Level>(m, "Level")
+        .value("DEBUG", Level::DEBUG)
+        .value("INFO", Level::INFO)
+        .value("WARNING", Level::WARN)
+        .value("ERROR", Level::ERROR)
+        .value("CRITICAL", Level::CRITICAL)
+        .value("FATAL", Level::CRITICAL);
+}
+
+}  // namespace UC::Logger

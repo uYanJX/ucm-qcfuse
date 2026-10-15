@@ -32,9 +32,10 @@ module itself can be imported without a GPU host.
 """
 
 import copy
+import json
 import os
 import time
-from dataclasses import asdict
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -208,13 +209,23 @@ class BlendEngineBase:
         kv_connector_extra_config: dict = None,
         batch_size: int = 1,
         max_num_batched_tokens: Optional[int] = None,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: int = 131072,
+        block_size: int = 512,
+        rope_factor: Optional[float] = 4.0,
         **engine_kwargs,
     ):
         if batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if max_model_len < 1:
+            raise ValueError(f"max_model_len must be positive, got {max_model_len}")
+        if block_size < 1:
+            raise ValueError(f"block_size must be positive, got {block_size}")
         self.model_name = Path(model_path).name.lower()
         self.model_path = model_path
-        self.context_length = 16000
+        self.context_length = int(max_model_len)
+        self.block_size = int(block_size)
+        self.rope_factor = rope_factor
         self.batch_size = int(batch_size)
         self.attn_start = 0
         self.attn_end = -1
@@ -228,11 +239,25 @@ class BlendEngineBase:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
         # Lazy import: vLLM + UCM + transformers live only on the GPU host.
-        from transformers import AutoTokenizer
+        from transformers import AutoConfig, AutoTokenizer
         from vllm import LLM
         from vllm.config import KVTransferConfig
-        from vllm.engine.arg_utils import EngineArgs
         from vllm.inputs import TokensPrompt
+
+        self._hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        # Qwen3 checkpoints do not all share the same native context length.
+        # Use the value declared by the official checkpoint when constructing
+        # a YaRN override; a fixed 32768 silently changes the RoPE mapping for
+        # Qwen3-32B, whose native max position is 40960.
+        self._original_max_position_embeddings = int(
+            getattr(self._hf_config, "max_position_embeddings", 32768)
+        )
+        model_type = getattr(self._hf_config, "model_type", None)
+        if baseline != "fullcomp" and model_type != "qwen3":
+            raise ValueError(
+                "UCM QCFuse requires a Qwen3 checkpoint; "
+                f"model={model_path!r} has model_type={model_type!r}."
+            )
 
         self._TokensPrompt = TokensPrompt
 
@@ -262,24 +287,90 @@ class BlendEngineBase:
             "enforce_eager": True,
             "kv_transfer_config": ktc,
             "max_model_len": self.context_length,
+            "block_size": self.block_size,
             "max_num_batched_tokens": int(batched_tokens),
             "max_num_seqs": self.batch_size,
-            "gpu_memory_utilization": 0.6,
+            "gpu_memory_utilization": float(gpu_memory_utilization),
             "enable_prefix_caching": False,
             "enable_chunked_prefill": False,
             "tensor_parallel_size": 1,
             "trust_remote_code": True,
             "dtype": "bfloat16",
             "distributed_executor_backend": "mp",
+            "worker_extension_cls": "ucm.integration.vllm.qcfuse_worker.QcFuseWorkerExtension",
         }
+        if os.getenv("QCFUSE_DISABLE_FLASHINFER_AUTOTUNE", "0") == "1":
+            # FlashInfer's startup autotune allocates a transient workspace
+            # on top of Qwen3-32B BF16 weights and KV cache.  On an 80GB A800
+            # this can OOM before the first request even though the serving
+            # path itself fits; keep the backend available and skip only the
+            # optional autotune sweep.
+            engine_options["enable_flashinfer_autotune"] = False
+        if self.rope_factor is not None and float(self.rope_factor) > 0:
+            engine_options["hf_overrides"] = {
+                "rope_scaling": {
+                    "factor": float(self.rope_factor),
+                    "original_max_position_embeddings": (
+                        self._original_max_position_embeddings
+                    ),
+                    # vLLM 0.18+ reads the explicit rope_type field while
+                    # older transformers/vLLM paths still consume type.
+                    "rope_type": "yarn",
+                    "type": "yarn",
+                }
+            }
         engine_options.update(engine_kwargs)
-        llm_args = EngineArgs(model=model_path, **engine_options)
-        self.llm = LLM(**asdict(llm_args))
+        # Pass the public options directly to LLM.  Converting EngineArgs with
+        # ``asdict`` is not API-stable: vLLM 0.31 serializes nested compilation
+        # fields with ``None`` values that fail its pydantic validation, while
+        # the same options are accepted by the public constructor.
+        self.llm = LLM(model=model_path, **engine_options)
         self._engine = _unwrap_engine(self.llm)
 
         self._rid_counter = 0
 
         self.set_baseline(baseline)
+
+    def worker_process_identities(self):
+        """Capture worker identities before any offline cache producer runs."""
+        # This established RPC also works with workers initialized while the
+        # latest overlay was synchronizing. No new worker method is required.
+        snapshots = self.llm.collective_rpc("qcfuse_benchmark_snapshot", args=(False,))
+        identities = []
+        for snapshot in snapshots:
+            pid = int(snapshot["pid"])
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            fields = stat[stat.rfind(")") + 2 :].split()
+            identities.append({"pid": pid, "start_ticks": int(fields[19])})
+        return identities
+
+    @staticmethod
+    def gpu_memory_snapshot() -> dict:
+        """Return device-wide and process-local CUDA memory counters."""
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return {"cuda_available": False}
+            torch.cuda.synchronize()
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            return {
+                "cuda_available": True,
+                "gpu_index": int(torch.cuda.current_device()),
+                "gpu_memory_total_bytes": int(total_bytes),
+                "gpu_memory_free_bytes": int(free_bytes),
+                "gpu_memory_used_bytes": int(total_bytes - free_bytes),
+                "torch_memory_allocated_bytes": int(torch.cuda.memory_allocated()),
+                "torch_memory_reserved_bytes": int(torch.cuda.memory_reserved()),
+                "torch_peak_memory_allocated_bytes": int(
+                    torch.cuda.max_memory_allocated()
+                ),
+                "torch_peak_memory_reserved_bytes": int(
+                    torch.cuda.max_memory_reserved()
+                ),
+            }
+        except Exception as exc:
+            return {"cuda_available": False, "error": str(exc)}
 
     def set_baseline(self, baseline: str):
         """Switch baseline configuration."""
@@ -300,7 +391,7 @@ class BlendEngineBase:
 
         from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+        config = self._hf_config
         head_dim = getattr(config, "head_dim", None)
         if head_dim is None:
             head_dim = config.hidden_size // config.num_attention_heads
@@ -329,21 +420,42 @@ class BlendEngineBase:
         """Get model template based on model name."""
         for prefix, template in TEMPLATES.items():
             if self.model_name.startswith(prefix):
+                if prefix == "qwen" and getattr(self, "thinking_mode", "off") == "on":
+                    # The checkpoint's enable_thinking=True generation prompt
+                    # ends at the assistant header; the model emits <think>.
+                    return (
+                        template[0],
+                        template[1],
+                        "<|im_end|>\n<|im_start|>assistant\n",
+                    )
                 return template
         return ("", "", "")
 
     def _build_prompt(
-        self, system_prompt: str, docs: List[str], q_prompt: List[str], use_sep: bool
+        self,
+        system_prompt: str,
+        docs: List[str],
+        q_prompt: List[str],
+        use_sep: bool,
+        answer_suffix: str = "\n\n## Answer\n",
+        answer_prefix: str = "",
     ) -> Tuple[str, str]:
         """Build complete prompt from components."""
         sys_h, sys_e, asst_h = self._get_template()
         prefix = sys_h + system_prompt + sys_e
-        suffix = "".join(q_prompt) + "\n\n## Answer\n" + asst_h
+        suffix = self._query_suffix(q_prompt, answer_suffix, asst_h, answer_prefix)
 
         if use_sep:
             query_sep = BLEND_SEP.join(q_prompt)
             return BLEND_SEP.join([prefix] + docs + [suffix]), query_sep
         return prefix + "".join(docs) + suffix, suffix
+
+    def _query_suffix(self, q_prompt, answer_suffix, assistant_header, answer_prefix):
+        if getattr(self, "thinking_mode", "off") == "on":
+            # Keep the official RULER completion hint inside the user turn.
+            # An assistant prefill would otherwise bypass native reasoning.
+            return "".join(q_prompt) + answer_prefix + answer_suffix + assistant_header
+        return "".join(q_prompt) + answer_suffix + assistant_header + answer_prefix
 
     # ------------------------------------------------------------------ #
     #  vLLM-via-UCM request driving (replaces sgl.Engine.generate)
@@ -392,11 +504,23 @@ class BlendEngineBase:
         started = {}
         results = {}
         unfinished = set()
+        last_token_ids = {}
+        output_progress = {}
+        step_profile_path = getattr(self, "generation_step_profile_path", None)
+        step_profile = []
         for prompt_token_ids, sampling_params, blend_args in requests:
             rid = self._next_request_id()
+            if hasattr(self, "tokenizer"):
+                from output_protocol import OutputProgress
+
+                output_progress[rid] = OutputProgress(
+                    self.tokenizer, getattr(self, "thinking_mode", "off") == "on"
+                )
             request_ids.append(rid)
             started[rid] = time.perf_counter()
             unfinished.add(rid)
+            if blend_args is not None:
+                blend_args = {**blend_args, "client_request_id": rid}
             params = self._build_sampling_params(sampling_params, blend_args)
             self._engine.add_request(
                 rid,
@@ -404,14 +528,29 @@ class BlendEngineBase:
                 params,
             )
             results[rid] = {
+                "request_id": rid,
                 "text": "",
                 "ttft": None,
                 "latency": None,
+                "decode": None,
+                "first_token_seconds": None,
+                "first_token_time": None,
                 "generated_tokens": 0,
+                "first_token_output_tokens": 0,
+                "decode_tokens": 0,
+                "output_token_ids": [],
+                "sampling_max_tokens": getattr(params, "max_tokens", None),
             }
 
         while unfinished:
-            for out in self._engine.step():
+            if step_profile_path:
+                step_started = time.perf_counter()
+                active_before = len(unfinished)
+            outputs = self._engine.step()
+            if step_profile_path:
+                step_finished = time.perf_counter()
+                generated_before = sum(x["generated_tokens"] for x in results.values())
+            for out in outputs:
                 rid = str(getattr(out, "request_id", ""))
                 if rid not in unfinished:
                     continue
@@ -421,13 +560,75 @@ class BlendEngineBase:
                     token_ids = getattr(candidate, "token_ids", ()) or ()
                     if results[rid]["ttft"] is None and token_ids:
                         results[rid]["ttft"] = now - started[rid]
+                        results[rid]["first_token_seconds"] = now - started[rid]
+                        results[rid]["first_token_time"] = now
+                        results[rid]["first_token_output_tokens"] = len(token_ids)
                     results[rid]["text"] = candidate.text
                     results[rid]["generated_tokens"] = len(token_ids)
+                    last_token_ids[rid] = token_ids
+                    if rid in output_progress:
+                        output_progress[rid].update(token_ids, now)
                 if bool(getattr(out, "finished", False)):
+                    results[rid]["output_token_ids"] = list(last_token_ids.get(rid, ()))
+                    results[rid]["finish_reason"] = getattr(
+                        candidate, "finish_reason", None
+                    )
+                    if rid in output_progress:
+                        progress = output_progress[rid]
+                        results[rid][
+                            "first_thinking_time"
+                        ] = progress.first_thinking_time
+                        results[rid]["first_answer_time"] = progress.first_answer_time
+                    results[rid]["finished_time"] = now
                     results[rid]["latency"] = now - started[rid]
                     if results[rid]["ttft"] is None:
                         results[rid]["ttft"] = results[rid]["latency"]
+                    if results[rid]["first_token_seconds"] is None:
+                        results[rid]["first_token_seconds"] = results[rid]["latency"]
+                    first_token_time = results[rid]["first_token_time"]
+                    results[rid]["decode"] = (
+                        max(0.0, now - first_token_time)
+                        if first_token_time is not None
+                        else 0.0
+                    )
+                    results[rid]["decode_tokens"] = max(
+                        0,
+                        results[rid]["generated_tokens"]
+                        - results[rid]["first_token_output_tokens"],
+                    )
                     unfinished.remove(rid)
+
+            if step_profile_path:
+                step_profile.append(
+                    {
+                        "step": len(step_profile),
+                        "active_before": active_before,
+                        "active_after": len(unfinished),
+                        "engine_step_seconds": step_finished - step_started,
+                        "frontend_output_seconds": time.perf_counter() - step_finished,
+                        "new_output_tokens": sum(
+                            x["generated_tokens"] for x in results.values()
+                        )
+                        - generated_before,
+                    }
+                )
+
+        if step_profile_path:
+            path = Path(step_profile_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            phase = (requests[0][2] or {}).get("blend_style", "full_prefill")
+            with path.open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "phase": phase,
+                            "request_ids": request_ids,
+                            "scope": "instrumented_parent_engine_step_and_output_processing_not_exclusive_GPU_time",
+                            "steps": step_profile,
+                        }
+                    )
+                    + "\n"
+                )
 
         return [results[rid] for rid in request_ids]
 
@@ -456,15 +657,35 @@ class BlendEngineBase:
         self, prompt: str, params, blend_args: Optional[dict]
     ) -> Tuple[List[int], object, Optional[dict]]:
         """Tokenize one request and add separator-removed chunk boundaries."""
+        if isinstance(prompt, list):
+            if blend_args is not None:
+                raise ValueError(
+                    "Pre-tokenized baseline prompts cannot carry blend args"
+                )
+            return prompt, params, None
+        cache = getattr(self, "_prompt_token_cache", None)
+        if cache is None:
+            cache = self._prompt_token_cache = OrderedDict()
+        cache_key = (prompt, blend_args is not None)
+        if cache_key in cache:
+            stripped_ids, locs = cache.pop(cache_key)
+        else:
+            ids = self._tokenize(prompt)
+            if blend_args is None:
+                stripped_ids, locs = ids, None
+            else:
+                from ucm.sparse.qcfuse.blend_info import split_tokens
+
+                _, stripped_ids, locs = split_tokens(
+                    None, ids, BLEND_SEP, self._sep_token
+                )
+                if locs is None:
+                    locs = [0, len(stripped_ids)]
+        cache[cache_key] = (stripped_ids, locs)
+        while len(cache) > 8:
+            cache.popitem(last=False)
         if blend_args is None:
-            return self._tokenize(prompt), params, None
-
-        from ucm.sparse.qcfuse.blend_info import split_tokens
-
-        ids = self._tokenize(prompt)
-        _, stripped_ids, locs = split_tokens(None, ids, BLEND_SEP, self._sep_token)
-        if locs is None:
-            locs = [0, len(stripped_ids)]
+            return stripped_ids, params, None
         prepared_args = dict(blend_args)
         prepared_args["blend_loc_list"] = [int(x) for x in locs]
         return stripped_ids, params, prepared_args
@@ -473,6 +694,23 @@ class BlendEngineBase:
         self,
         requests: Sequence[Tuple[str, object, Optional[dict]]],
     ) -> List[dict]:
+        requests = list(requests)
+        if self.baseline in ("ours", "fuserag", "prophetkv"):
+            # QCFuse's position-aware ragged path is validated through four
+            # simultaneous requests. Split a larger user batch before it
+            # reaches vLLM; letting the scheduler mix later prefill with decode
+            # requests would violate QCFuse's homogeneous-step invariant.
+            try:
+                safe_batch = int(os.getenv("QCFUSE_MAX_SAFE_BATCH_SIZE", "4"))
+            except ValueError:
+                safe_batch = 4
+            if safe_batch > 0 and len(requests) > safe_batch:
+                outputs: List[dict] = []
+                for start in range(0, len(requests), safe_batch):
+                    outputs.extend(
+                        self._generate_batch(requests[start : start + safe_batch])
+                    )
+                return outputs
         prepared = [
             self._prepare_generation(prompt, params, blend_args)
             for prompt, params, blend_args in requests

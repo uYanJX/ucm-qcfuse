@@ -1,0 +1,14 @@
+include CMakeLists.txt
+include version.ini
+include ucm_patch.pth
+include THIRD_PARTY_NOTICES.md
+include requirements-qcfuse.txt
+graft LICENSES
+graft ucm
+graft kv_semantics
+graft test
+graft tests
+graft examples
+graft benchmarks
+global-exclude *.patch *.pt *.bin *.py[cod] *.log *.jsonl
+global-exclude __pycache__

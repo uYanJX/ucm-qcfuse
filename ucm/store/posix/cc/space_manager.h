@@ -1,0 +1,73 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ * */
+#ifndef UNIFIEDCACHE_POSIX_STORE_CC_SPACE_MANAGER_H
+#define UNIFIEDCACHE_POSIX_STORE_CC_SPACE_MANAGER_H
+
+#include "gc_config_guard.h"
+#include "global_config.h"
+#include "hotness_tracker.h"
+#include "shard_gc.h"
+#include "space_layout.h"
+#include "thread/latch.h"
+#include "thread/thread_pool.h"
+
+namespace UC::PosixStore {
+
+class SpaceManager {
+    struct PrefixLookupContext {
+        const Detail::BlockId* blocks;
+        size_t begin;
+        size_t end;
+        size_t nWorker;
+        std::shared_ptr<std::atomic<ssize_t>> firstFail;
+        std::shared_ptr<std::atomic<int32_t>> status;
+        std::shared_ptr<Latch> waiter;
+    };
+
+private:
+    SpaceLayout layout_;
+    ThreadPool<PrefixLookupContext> prefixLookupSrv_;
+    HotnessTracker hotnessTracker_;
+    ShardGarbageCollector gcMgr_;
+    GcConfigGuard gcConfigGuard_;
+    bool hotnessTrackerEnable_{false};
+    bool gcEnable_{false};
+
+public:
+    Status Setup(const Config& config);
+    Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num);
+    Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num);
+    Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num);
+    void Prefetch(const Detail::BlockId* blocks, size_t num);
+    const SpaceLayout* GetLayout() const { return &layout_; }
+
+private:
+    uint8_t Lookup(const Detail::BlockId* block);
+    void OnLookupPrefix(PrefixLookupContext& ctx);
+    void OnLookupPrefixTimeout(PrefixLookupContext& ctx);
+};
+
+}  // namespace UC::PosixStore
+
+#endif

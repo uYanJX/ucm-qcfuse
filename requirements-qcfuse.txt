@@ -1,0 +1,4 @@
+# Install in the compatible PyTorch/vLLM CUDA environment documented in README.
+pytest>=8,<9
+rouge-score>=0.1.2,<0.2
+typing-extensions>=4.8

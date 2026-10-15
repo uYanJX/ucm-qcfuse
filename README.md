@@ -1,69 +1,92 @@
-# UCM QCFuse
+# QCFuse on UCM
 
-This repository is a focused port of [QCFuse](https://github.com/uYanJX/QCFuse)
-to Huawei's [Unified Cache Management (UCM)](https://github.com/uYanJX/ucm-qcfuse). It contains only the QCFuse implementation,
-the required UCM/vLLM integration patch, targeted tests, and a benchmark runner.
-Model weights, datasets, generated caches, and raw logs are intentionally
-excluded.
+This branch contains UCM source with QCFuse integrated for vLLM 0.31 and
+Qwen3. Install this checkout directly; there is no overlay-copy or patch-file
+application step, and installed vLLM source files are not edited.
 
-The port preserves QCFuse's three-pass design:
+QCFuse reuses full KV caches while recomputing selected document tokens:
 
-1. `KVCOMPUTE` builds full KV, digest, and critical-layer caches.
-2. `QCOMPUTE` scores context tokens from the compressed view.
-3. `DO_BLEND` recomputes selected tokens and reconstructs attention with cached KV.
+1. **KVCOMPUTE** creates raw pre-RoPE KV, digest, and critical-layer caches.
+2. **QCOMPUTE** runs the query against the digest and retains selection inputs.
+3. **DO_BLEND** selects tokens, repairs cached KV, runs position-aware attention,
+   and writes the resulting full KV to vLLM for decoding.
 
-The implementation uses raw pre-RoPE Q/K/V, mean importance aggregation,
-position-aware ragged attention, bounded SSD/H2D layer prefetch, and per-request
-state. Homogeneous online batches are supported and have been smoke-tested with
-batch sizes 2 and 4. Offline `KVCOMPUTE` remains serial by design.
-
-## 🔥 News
-
-- **2026.10.02** 🚀 QCFuse is compatible with Huawei's [Unified Cache Management (UCM)](https://github.com/uYanJX/ucm-qcfuse) framework and supports multi-batch inference.
-- **2026.10.02** 🚀 Qwen3-32B reasoning evaluation on HotpotQA and 2WikiMQA keeps selected configurations within 1% relative ROUGE-L of full computation; see [NEWS.md](NEWS.md).
+The recomputation ratio controls document-token selection. It is not a KV
+compression ratio or a promise that total model work scales by that fraction.
 
 ## Compatibility
 
-- UCM base revision: `61c8387518592c545e88d205e58a7fc3edd8d119`
-- QCFuse reference revision: `1416459ada5bec0695ec375ada435e407cdea699`
-- vLLM 0.11, Qwen3, CUDA, and Triton
-- Tensor parallel size 1, pipeline parallel size 1, eager execution
-- Prefix caching disabled; each online batch must use one phase and an unchunked prefill
+The QCFuse path is validated with Python 3.10, PyTorch 2.14.1+cu130,
+vLLM 0.31.0, Transformers 5.19.0, Qwen3 BF16, CUDA and Triton. Use tensor and
+pipeline parallel sizes of one, eager execution, disabled prefix caching and
+unchunked prefill. Homogeneous online batches are supported; offline cache
+construction is serial. Required GPU memory depends on total input tokens,
+model weights, native KV pages, source-cache residency and workspace.
 
-## Apply to UCM
+GPU-resident mode maintains an immutable source cache alongside the online KV
+pool. A model/context fitting full prefill does not guarantee that GPU-resident
+fusion fits. CPU/SSD modes provide bounded layer staging. The runner reports
+capacity failures rather than silently truncating inputs or changing precision.
 
-Start from the compatible UCM revision, then apply the tracked-file patch and
-copy the new modules:
+Old post-RoPE caches must be rebuilt. Other UCM integrations are retained as
+upstream source, but this branch's QCFuse support statement covers the runtime
+above; historical external patch bundles are not distributed.
+
+## Install
+
+Use a Linux CUDA environment with the versions above, a matching CUDA toolkit,
+a C++17 compiler and CMake. The vLLM wheel must match the installed PyTorch/CUDA
+runtime. Then install this source tree:
 
 ```bash
-git -C /path/to/unified-cache-management checkout 61c8387518592c545e88d205e58a7fc3edd8d119
-git -C /path/to/unified-cache-management apply "$PWD/patches/ucm-vllm-v0110-integration.patch"
-cp -a overlay/. /path/to/unified-cache-management/
+git clone --branch ucm-adapt git@github.com:uYanJX/ucm-qcfuse.git
+cd ucm-qcfuse
+python -m pip install -r requirements-build.txt
+PLATFORM=cuda python -m pip install --no-build-isolation -e .
+python -m pip install -r requirements-qcfuse.txt
 ```
 
-Install UCM and its patched vLLM environment as usual. Existing post-RoPE
-QCFuse cache files are incompatible and must be rebuilt.
-
-## Validate
+Enable the UCM runtime integration when running inference:
 
 ```bash
-PYTHONPATH=/path/to/unified-cache-management pytest -q tests/qcfuse -k "not cuda"
-
-CUDA_VISIBLE_DEVICES=0 \
-QCFUSE_REFERENCE_DIR=/path/to/QCFuse \
-PYTHONPATH=/path/to/unified-cache-management \
-pytest -q tests/qcfuse/test_cuda_kernels.py
+export ENABLE_UCM_PATCH=1
+export ENABLE_SPARSE=1
 ```
 
-See [benchmarks/qcfuse/README.md](benchmarks/qcfuse/README.md) for evaluation
-commands and [RESULTS.md](RESULTS.md) for the retained 30-sample smoke results.
+`ENABLE_UCM_PATCH` is the upstream name for runtime hook activation; it does
+not mean applying an external patch file. Benchmark runners configure the
+QCFuse connector and worker extension automatically.
 
-## Repository Layout
+## Run and test
 
-- `overlay/`: new files copied into a UCM checkout.
-- `patches/`: minimal changes to existing UCM and vLLM patch files.
-- `tests/qcfuse/`: CPU and CUDA regression tests.
-- `benchmarks/qcfuse/`: LongBench/RULER evaluation driver.
+See [the evaluation guide](benchmarks/qcfuse/README.md) for frozen manifests,
+quality runs, repeated timing, cold/warm storage and cleanup behavior.
+Models, datasets and experiment outputs are supplied locally.
 
-Licensing and upstream attribution are documented in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+```bash
+PYTHONPATH="$PWD" python -m pytest -q tests/qcfuse -k 'not cuda'
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD" \
+  python -m pytest -q tests/qcfuse/test_cuda_kernels.py
+```
+
+Set `QCFUSE_REFERENCE_DIR` to a local checkout of the pinned QCFuse reference
+to enable optional upstream differential checks. Benchmarks recognize
+`fullcomp` and `ours` as verified implementation identities; unvalidated
+variants are not reported as CacheBlend or ProphetKV.
+
+## Source map
+
+| Path | Purpose |
+|---|---|
+| `ucm/sparse/qcfuse/` | Selection, request state, pre-RoPE fusion and position-aware attention |
+| `ucm/store/qcfuse/` | Packed cache format, CPU/GPU residency and bounded SSD/H2D prefetch |
+| `ucm/integration/vllm/latest_sparse.py` | Native vLLM 0.31 Qwen3 hooks |
+| `ucm/integration/vllm/qcfuse_connector.py` | Scheduler/worker request metadata |
+| `ucm/integration/vllm/qcfuse_worker.py` | Residency control and measurement snapshots |
+| `benchmarks/qcfuse/` | Dataset preparation, measured runs, queue and result validation |
+| `tests/qcfuse/` | CPU, CUDA, lifecycle and benchmark-contract tests |
+| `ucm/`, `kv_semantics/`, `test/` | UCM Python/native source and upstream tests |
+
+Private experiment logs, generated answers, host configuration, model files,
+datasets and caches are excluded. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+for upstream revisions and licenses.

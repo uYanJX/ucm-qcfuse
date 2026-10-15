@@ -1,0 +1,17 @@
+file(GLOB_RECURSE UCMSTORE_PC_CC_SOURCE_FILES "./cc/*.cc")
+add_library(pcstore STATIC ${UCMSTORE_PC_CC_SOURCE_FILES})
+target_include_directories(pcstore PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/cc/api
+    ${CMAKE_CURRENT_SOURCE_DIR}/cc/domain
+)
+target_link_libraries(pcstore PUBLIC storeintf trans infra_logger)
+
+file(GLOB_RECURSE UCMSTORE_PC_CPY_SOURCE_FILES "./cpy/*.cc")
+pybind11_add_module(ucmpcstore ${UCMSTORE_PC_CPY_SOURCE_FILES})
+target_link_libraries(ucmpcstore PRIVATE pcstore)
+
+file(RELATIVE_PATH INSTALL_REL_PATH
+     ${UCM_ROOT_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}
+)
+install(TARGETS ucmpcstore LIBRARY DESTINATION ${INSTALL_REL_PATH} COMPONENT ucm)

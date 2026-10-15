@@ -1,0 +1,15 @@
+reports/
+dataset/
+logs/
+result_outputs/
+results/
+.cache/
+backup/
+sites/Demo/*
+$null
+*__pycache__/
+.*
+*.log
+start.bat
+*demo.py
+!.gitignore
