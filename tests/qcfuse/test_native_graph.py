@@ -134,3 +134,22 @@ def test_forward_profile_rejects_replay_without_arming_unbounded_hook(tmp_path):
         worker.qcfuse_start_execution_profile(str(tmp_path / "unused.json"))
     assert not model._forward_pre_hooks
     assert not (tmp_path / "unused.json").exists()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_public_pipeline_constructor_forwards_graph_option(monkeypatch, enabled):
+    from pathlib import Path
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).parents[2] / "benchmarks" / "qcfuse")
+    )
+    from blend_common import BlendEngineBase
+    from blend_ssd import SSDPipelineEngine
+
+    calls = []
+    monkeypatch.setattr(
+        BlendEngineBase, "__init__", lambda self, *args, **kwargs: calls.append(kwargs)
+    )
+    engine = SSDPipelineEngine("model", decode_cudagraph=enabled)
+    assert calls[0]["decode_cudagraph"] is enabled
+    assert engine.storage_mode == "ssd"
