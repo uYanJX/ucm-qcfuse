@@ -100,6 +100,9 @@ variants are not reported as CacheBlend or ProphetKV.
 | `ucm/integration/vllm/latest_sparse.py` | Native vLLM 0.31 Qwen3 hooks |
 | `ucm/integration/vllm/qcfuse_connector.py` | Scheduler/worker request metadata |
 | `ucm/integration/vllm/qcfuse_worker.py` | Residency control, memory attribution and bounded profiling |
+| `benchmarks/qcfuse/` | Dataset preparation, measured runs, queue and result validation |
+| `tests/qcfuse/` | CPU, CUDA, lifecycle and benchmark-contract tests |
+| `ucm/`, `kv_semantics/`, `test/` | UCM Python/native source and upstream tests |
 
 For diagnostics, the configured worker extension exposes named RPCs that work
 with the current vLLM serializer:
@@ -120,14 +123,27 @@ finally:
 Use a trace path containing `{rank}` when running more than one rank. The
 profiler records tensor shapes and stops before the forward following its
 budget; the final RPC also handles requests that end earlier. It removes its
-model callback before later decode. Detailed profiles include instrumentation
+model callback before later decode. To profile decode alone, pass a third
+argument with the number of forwards to skip; for a QCOMPUTE request followed
+by sparse prefill, `args=("/path/to/new-decode-trace.json", 32, 2)` captures up
+to 32 subsequent forwards. Skipped forwards are not traced. Detailed profiles include instrumentation
 overhead and must be disabled for formal timing. Memory attribution counts
 unique parameter and observed native KV storage; allocator reservations must
 not be added again as live tensor memory.
-| `benchmarks/qcfuse/` | Dataset preparation, measured runs, queue and result validation |
-| `tests/qcfuse/` | CPU, CUDA, lifecycle and benchmark-contract tests |
-| `ucm/`, `kv_semantics/`, `test/` | UCM Python/native source and upstream tests |
 
 Private experiment logs, generated answers, host configuration, model files,
 datasets and caches are excluded. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 for upstream revisions and licenses.
+
+## GPU FFN workspace experiment
+
+`QCFUSE_GPU_FFN_TILE_TOKENS=8192` optionally bounds projection rows for the
+existing BF16, single-rank, unquantized GPU-resident sparse-prefill fast path.
+The default is `0` (whole-matrix projections). Tiling balances uneven ends and
+keeps every selected row, both weights, native SiLU and the original position
+mask. CPU/SSD, ordinary prefill and decode use their existing paths.
+
+This controls transient memory rather than promising a latency gain. GEMM
+shapes change, so verify selection, token outputs and quality against the
+whole-matrix configuration on the same inputs before adopting it. Frozen-run
+receipts record the configured tile budget separately.

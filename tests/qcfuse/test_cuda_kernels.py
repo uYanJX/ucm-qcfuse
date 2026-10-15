@@ -162,6 +162,9 @@ def _delete_generated_test_kv(request):
 @pytest.mark.parametrize("batch", [1, 2, 4])
 def test_compact_native_silu_and_full_gemm_are_bit_exact(batch):
     from types import SimpleNamespace
+    from vllm import _custom_ops  # noqa: F401 - registers native CUDA operators
+
+    operation = torch.ops._C.silu_and_mul
     from ucm.integration.vllm.latest_sparse import (
         _compact_silu_and_mul,
         _compact_qwen_mlp_forward,
@@ -171,8 +174,8 @@ def test_compact_native_silu_and_full_gemm_are_bit_exact(batch):
     tokens, hidden, intermediate = batch * 513, 5120, 25600
     gate = torch.randn(tokens, intermediate * 2, device="cuda", dtype=torch.bfloat16)
     expected_activation = gate.new_empty((tokens, intermediate))
-    torch.ops._C.silu_and_mul(expected_activation, gate)
-    actual_activation = _compact_silu_and_mul(gate, torch.ops._C.silu_and_mul)
+    operation(expected_activation, gate)
+    actual_activation = _compact_silu_and_mul(gate, operation)
     assert (
         actual_activation.untyped_storage().data_ptr()
         == gate.untyped_storage().data_ptr()
@@ -190,16 +193,53 @@ def test_compact_native_silu_and_full_gemm_are_bit_exact(batch):
     )
     up = torch.nn.functional.linear(x, up_weight)
     activated = up.new_empty((tokens, intermediate))
-    torch.ops._C.silu_and_mul(activated, up)
+    operation(activated, up)
     expected = torch.nn.functional.linear(activated, down_weight)
     del up, activated
     mlp = SimpleNamespace(
         gate_up_proj=lambda t: (torch.nn.functional.linear(t, up_weight), None),
-        act_fn=SimpleNamespace(op=torch.ops._C.silu_and_mul),
+        act_fn=SimpleNamespace(op=operation),
         down_proj=SimpleNamespace(weight=down_weight),
     )
     actual = _compact_qwen_mlp_forward(mlp, x)
     assert actual is x
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_gpu_ffn_row_tiles_keep_all_rows_and_native_output(batch):
+    from types import SimpleNamespace
+    from vllm import _custom_ops  # noqa: F401 - registers native CUDA operators
+
+    operation = torch.ops._C.silu_and_mul
+    from ucm.integration.vllm.latest_sparse import _compact_qwen_mlp_forward
+
+    # A raw 8192-row split would leave one row: balanced tiles avoid this
+    # boundary for the actual Qwen3-32B BF16 projection dimensions.
+    tokens, hidden, intermediate = batch * 8193, 5120, 25600
+    source = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    up = (
+        torch.randn(intermediate * 2, hidden, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    )
+    down = torch.randn(hidden, intermediate, device="cuda", dtype=torch.bfloat16) * 0.01
+    rows_seen = []
+
+    def project(value):
+        rows_seen.append(value.shape[0])
+        return torch.nn.functional.linear(value, up), None
+
+    mlp = SimpleNamespace(
+        gate_up_proj=project,
+        act_fn=SimpleNamespace(op=operation),
+        down_proj=SimpleNamespace(weight=down),
+    )
+    expected = _compact_qwen_mlp_forward(mlp, source.clone())
+    rows_seen.clear()
+    work = source.clone()
+    actual = _compact_qwen_mlp_forward(mlp, work, projection_tile_tokens=8192)
+    assert actual is work and sum(rows_seen) == tokens
+    assert max(rows_seen) <= 8192 and min(rows_seen) >= 4096
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

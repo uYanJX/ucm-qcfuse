@@ -54,12 +54,30 @@ def _compact_silu_and_mul(gate_up, operation, tile_tokens=512):
     return flat[: tokens * intermediate].view(tokens, intermediate)
 
 
-def _compact_qwen_mlp_forward(mlp, hidden_states):
-    """Reuse BF16 single-rank FFN buffers without changing either GEMM shape."""
+def _compact_qwen_mlp_forward(mlp, hidden_states, projection_tile_tokens=0):
+    """Reuse BF16 FFN buffers, optionally bounding projection rows.
+
+    Row tiling is an opt-in experiment. Balance the rows so an uneven end
+    does not force a singleton GEMM, and keep all selected rows and weights.
+    Each tile's projection storage dies before the next tile is allocated.
+    """
+    if (
+        isinstance(projection_tile_tokens, bool)
+        or not isinstance(projection_tile_tokens, int)
+        or projection_tile_tokens < 0
+    ):
+        raise ValueError("projection_tile_tokens must be a non-negative integer")
+    tokens = hidden_states.shape[0]
+    if projection_tile_tokens and tokens > projection_tile_tokens:
+        parts = (tokens + projection_tile_tokens - 1) // projection_tile_tokens
+        rows = (tokens + parts - 1) // parts
+        for start in range(0, tokens, rows):
+            _compact_qwen_mlp_forward(mlp, hidden_states[start : start + rows])
+        return hidden_states
     gate_up, _ = mlp.gate_up_proj(hidden_states)
     activation = _compact_silu_and_mul(gate_up, mlp.act_fn.op)
     # Input projection has consumed hidden_states. Native BF16 F.linear and
-    # its out overload use the same full matrix dimensions; no GEMM tiling.
+    # its out overload use the same matrix dimensions for this projection.
     return torch.ops.aten.linear.out(
         activation, mlp.down_proj.weight, None, out=hidden_states
     )
@@ -99,6 +117,7 @@ def install_vllm_latest_sparse_hooks() -> None:
     global _INSTALLED
     if _INSTALLED:
         return
+    import os
     import vllm
     from packaging.version import Version
 
@@ -106,6 +125,9 @@ def install_vllm_latest_sparse_hooks() -> None:
         raise RuntimeError(
             f"latest_sparse adapter requires vLLM >= 0.31, got {vllm.__version__}"
         )
+    projection_tile_tokens = int(os.getenv("QCFUSE_GPU_FFN_TILE_TOKENS", "0"))
+    if projection_tile_tokens < 0:
+        raise ValueError("QCFUSE_GPU_FFN_TILE_TOKENS must be non-negative")
 
     from ucm.sparse.state import (
         get_ucm_sparse,
@@ -185,7 +207,9 @@ def install_vllm_latest_sparse_hooks() -> None:
                 and compact_values()
                 and _can_compact_qwen_mlp(self.mlp, hidden_states, residual)
             ):
-                hidden_states = _compact_qwen_mlp_forward(self.mlp, hidden_states)
+                hidden_states = _compact_qwen_mlp_forward(
+                    self.mlp, hidden_states, projection_tile_tokens
+                )
             else:
                 hidden_states = self.mlp(hidden_states)
             hidden_states, residual = maybe_execute_sparse_ffn_finished(

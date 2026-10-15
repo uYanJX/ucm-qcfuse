@@ -190,3 +190,11 @@ def test_deferred_profile_failed_hook_install_does_not_stop_unstarted_profiler(
             str(tmp_path / "failed.json"), skip_forwards=2
         )
     assert not profiler_calls
+
+
+@pytest.mark.parametrize("tile", [-1, True, 1.5])
+def test_ffn_projection_budget_rejects_invalid_values_before_compute(tile):
+    from ucm.integration.vllm.latest_sparse import _compact_qwen_mlp_forward
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _compact_qwen_mlp_forward(None, torch.ones(2, 3), projection_tile_tokens=tile)

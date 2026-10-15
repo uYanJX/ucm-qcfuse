@@ -252,6 +252,9 @@ def main():
                 os.getenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5")
             ),
             "offline_build_workspace": os.getenv("QCFUSE_OFFLINE_BUILD_WORKSPACE"),
+            "gpu_ffn_projection_tile_tokens": int(
+                os.getenv("QCFUSE_GPU_FFN_TILE_TOKENS", "0")
+            ),
         },
     }
     engine = None
