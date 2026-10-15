@@ -807,3 +807,83 @@ def test_bounded_worker_profile_keeps_cuda_outputs_and_removes_decode_hook(
     assert not model._forward_pre_hooks
     trace = json.loads(path.read_text())
     assert any(event.get("cat") == "kernel" for event in trace["traceEvents"])
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_native_graph_boundary_reuse_preserves_cuda_outputs(batch):
+    from types import SimpleNamespace
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from ucm.integration.vllm.qcfuse_graph import install_v2_graph_hooks
+    from ucm.integration.vllm.qcfuse_worker import QcFuseWorkerExtension
+
+    torch.manual_seed(501 + batch)
+    model = torch.nn.Linear(64, 32, bias=False).cuda().to(torch.bfloat16)
+    source = torch.randn(batch, 64, device="cuda", dtype=torch.bfloat16)
+    static = source.clone()
+    warm = torch.cuda.Stream()
+    warm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm):
+        for _ in range(3):
+            model(static)
+    torch.cuda.current_stream().wait_stream(warm)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = model(static)
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=batch,
+        num_reqs=batch,
+        uniform_token_count=1,
+        max_query_len=1,
+    )
+
+    def replay(_desc):
+        graph.replay()
+        return output
+
+    manager = SimpleNamespace(
+        graphs={desc: graph},
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        dispatch=lambda *args, **kwargs: desc,
+        run_fullgraph=replay,
+    )
+    sparse = SimpleNamespace(prepared="stale-prefill")
+    builds = []
+
+    def build(scheduler, states, input_batch, metadata):
+        sparse.prepared = None
+        builds.append(scheduler)
+
+    sparse.build_sparse_meta = build
+    runner = SimpleNamespace(
+        model=model,
+        cudagraph_manager=manager,
+        kv_connector=SimpleNamespace(pre_forward=lambda **kwargs: None),
+        req_states=None,
+        _ucm_latest_input_batch=None,
+        _ucm_latest_sparse_meta_built_for=None,
+    )
+    install_v2_graph_hooks(runner, lambda: True, lambda: sparse)
+    worker = QcFuseWorkerExtension()
+    worker.model_runner = runner
+    worker.qcfuse_start_execution_mode_observer()
+    try:
+        for offset in (0.0, 0.5, -0.25):
+            scheduler = SimpleNamespace()
+            sparse.prepared = "stale-prefill"
+            value = source + offset
+            saved = value.clone()
+            static.copy_(value)
+            runner.kv_connector.pre_forward(
+                scheduler_output=scheduler, attn_metadata={}
+            )
+            assert sparse.prepared is None
+            actual = manager.run_fullgraph(desc)
+            torch.testing.assert_close(actual, model(value), rtol=0, atol=0)
+            torch.testing.assert_close(value, saved, rtol=0, atol=0)
+        assert len(builds) == 3
+        assert worker._qcfuse_execution_modes["full_graph_replays"] == 3
+    finally:
+        worker._qcfuse_execution_mode_hook.remove()
+        graph.reset()

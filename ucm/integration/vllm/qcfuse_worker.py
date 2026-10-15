@@ -35,12 +35,62 @@ class QcFuseWorkerExtension:
         observation = getattr(self, "_qcfuse_forward_observation", None)
         if observation is not None:
             result["forward_observation"] = dict(observation)
+        execution = getattr(self, "_qcfuse_execution_modes", None)
+        if execution is not None:
+            result["native_execution_modes"] = {
+                **execution,
+                "eager_input_token_histogram": dict(
+                    execution["eager_input_token_histogram"]
+                ),
+            }
         if not reset_peak:
             handle = getattr(self, "_qcfuse_forward_observer_handle", None)
             if handle is not None:
                 handle.remove()
                 self._qcfuse_forward_observer_handle = None
         return result
+
+    def qcfuse_start_execution_mode_observer(self):
+        """Count actual eager forwards and native replays without CUDA sync."""
+        if getattr(self, "_qcfuse_execution_modes", None) is not None:
+            return dict(self._qcfuse_execution_modes)
+        runner = self.model_runner
+        manager = getattr(runner, "cudagraph_manager", None)
+        graphs = getattr(manager, "graphs", {})
+        state = self._qcfuse_execution_modes = {
+            "available": bool(graphs),
+            "configured_mode": str(getattr(manager, "cudagraph_mode", None)),
+            "captured_token_counts": sorted({int(desc.num_tokens) for desc in graphs}),
+            "eager_model_forwards": 0,
+            "full_graph_replays": 0,
+            "eager_input_token_histogram": {},
+        }
+
+        def eager_forward(_module, args, kwargs):
+            value = kwargs.get("input_ids")
+            if value is None:
+                value = kwargs.get("inputs_embeds")
+            if value is None and args:
+                value = args[0]
+            state["eager_model_forwards"] += 1
+            if value is not None and hasattr(value, "shape"):
+                key = str(int(value.shape[0]))
+                histogram = state["eager_input_token_histogram"]
+                histogram[key] = histogram.get(key, 0) + 1
+
+        self._qcfuse_execution_mode_hook = runner.model.register_forward_pre_hook(
+            eager_forward, with_kwargs=True
+        )
+        if manager is not None:
+            original_replay = manager.run_fullgraph
+
+            def replay(*args, **kwargs):
+                output = original_replay(*args, **kwargs)
+                state["full_graph_replays"] += 1
+                return output
+
+            manager.run_fullgraph = replay
+        return dict(state)
 
     def qcfuse_memory_breakdown(self):
         """Attribute live model and native KV storage without copying tensors."""
@@ -106,6 +156,9 @@ class QcFuseWorkerExtension:
             or skip_forwards < 0
         ):
             raise ValueError("skip_forwards must be a non-negative integer")
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        if getattr(manager, "graphs", None):
+            raise ValueError("Bounded model-forward profiling requires eager execution")
         previous = getattr(self, "_qcfuse_execution_profile", None)
         if previous is not None and previous["profiler"] is not None:
             raise RuntimeError("An execution profile is already active")

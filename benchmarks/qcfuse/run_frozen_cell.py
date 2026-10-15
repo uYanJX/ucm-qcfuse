@@ -114,6 +114,7 @@ def main():
     parser.add_argument("--gpu-headroom-fixed-bytes", type=int, default=0)
     parser.add_argument("--gpu-resident-codec", choices=("ans_f16_bits",), default=None)
     parser.add_argument("--gpu-query-alias", choices=("on", "off"), default="off")
+    parser.add_argument("--decode-cudagraph", choices=("on", "off"), default="off")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--critical-layers", type=int, default=3)
     parser.add_argument("--offline-kv-device", choices=("cpu", "gpu"), default="cpu")
@@ -290,6 +291,7 @@ def main():
                 gpu_headroom_fixed_bytes=args.gpu_headroom_fixed_bytes,
                 gpu_resident_codec=args.gpu_resident_codec,
                 gpu_query_alias=args.gpu_query_alias == "on",
+                decode_cudagraph=args.decode_cudagraph == "on",
             )
             capture_workers = getattr(engine, "worker_process_identities", None)
             if callable(capture_workers):

@@ -213,6 +213,7 @@ class BlendEngineBase:
         max_model_len: int = 131072,
         block_size: int = 512,
         rope_factor: Optional[float] = 4.0,
+        decode_cudagraph: bool = False,
         **engine_kwargs,
     ):
         if batch_size < 1:
@@ -299,6 +300,16 @@ class BlendEngineBase:
             "distributed_executor_backend": "mp",
             "worker_extension_cls": "ucm.integration.vllm.qcfuse_worker.QcFuseWorkerExtension",
         }
+        if decode_cudagraph:
+            engine_options.update(
+                enforce_eager=False,
+                compilation_config={
+                    "mode": 0,
+                    "cudagraph_mode": "FULL_DECODE_ONLY",
+                    "cudagraph_capture_sizes": list(range(1, self.batch_size + 1)),
+                    "max_cudagraph_capture_size": self.batch_size,
+                },
+            )
         if os.getenv("QCFUSE_DISABLE_FLASHINFER_AUTOTUNE", "0") == "1":
             # FlashInfer's startup autotune allocates a transient workspace
             # on top of Qwen3-32B BF16 weights and KV cache.  On an 80GB A800
@@ -326,6 +337,8 @@ class BlendEngineBase:
         # the same options are accepted by the public constructor.
         self.llm = LLM(model=model_path, **engine_options)
         self._engine = _unwrap_engine(self.llm)
+        if decode_cudagraph:
+            self.llm.collective_rpc("qcfuse_start_execution_mode_observer")
 
         self._rid_counter = 0
 

@@ -147,3 +147,18 @@ This controls transient memory rather than promising a latency gain. GEMM
 shapes change, so verify selection, token outputs and quality against the
 whole-matrix configuration on the same inputs before adopting it. Frozen-run
 receipts record the configured tile budget separately.
+
+## Native decode graph experiment
+
+The frozen runner accepts `--decode-cudagraph on` (default: `off`). It uses
+native vLLM V2 `FULL_DECODE_ONLY`, disables compilation and captures decode
+batch sizes from 1 through the configured batch size. QCFuse prefill,
+including a one-token QCOMPUTE, remains eager. The connector refreshes sparse
+request state before replay, since replay bypasses Python model callbacks.
+
+Worker snapshots report captured token counts and actual graph replay/eager
+forward counters. Verify that replays occurred, compare all output tokens and
+selection/position hashes, and include capture memory in capacity checks.
+Graph capture cost belongs to startup; this option makes no unmeasured speed
+claim. Use separate eager diagnostics for the bounded model-forward profiler;
+a replay does not execute its Python hook.

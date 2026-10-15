@@ -525,6 +525,9 @@ def install_vllm_latest_sparse_hooks() -> None:
                     runner._ucm_latest_store_attached = True
                 if not getattr(runner, "_ucm_latest_instance_forward_wrapped", False):
                     import types
+                    from ucm.integration.vllm.qcfuse_graph import install_v2_graph_hooks
+
+                    install_v2_graph_hooks(runner, has_ucm_sparse, get_ucm_sparse)
 
                     original_prepare_inputs = runner.prepare_inputs
                     original_model_forward = runner.model.forward
