@@ -171,6 +171,12 @@ continuous requests against the same resident source. `--repeats` controls
 timing observations only; quality retains one observation per source. Receipts
 record the effective measurement count separately from CLI options.
 
+Explicit audit also records causal-pair work from the actual query positions
+and padded dot-product slots for the reference 128-by-64 kernel. Selecting half
+the rows need not select half the causal pairs. These are work counters rather
+than latency estimates; native FA3 uses its own tiling. Counts-only timing never
+copies position tensors or computes these diagnostic counters.
+
 ## Native decode graph experiment
 
 The frozen runner accepts `--decode-cudagraph on` (default: `off`). It uses

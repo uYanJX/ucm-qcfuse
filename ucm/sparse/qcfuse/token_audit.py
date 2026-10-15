@@ -83,6 +83,58 @@ def end_gpu_span(state, span):
         )
 
 
+def position_mask_work(positions, kv_tokens, query_block=128, key_block=64):
+    """Count actual causal pairs and reference tile slots, never predict latency.
+
+    This consumes an already copied CPU diagnostic tensor. Formal counts-only
+    measurements never copy positions or call this function.
+    """
+    import torch
+
+    if positions.device.type != "cpu" or positions.ndim != 1:
+        raise ValueError(
+            "Position-work diagnostics require a one-dimensional CPU tensor"
+        )
+    if kv_tokens < 1 or query_block < 1 or key_block < 1:
+        raise ValueError("KV and tile sizes must be positive")
+    if positions.numel() and bool(((positions < 0) | (positions >= kv_tokens)).any()):
+        raise ValueError("Observed attention positions are outside the retained KV")
+    values = positions.to(dtype=torch.int64)
+    valid_pairs = int((values + 1).sum())
+    full_pairs = kv_tokens * (kv_tokens + 1) // 2
+    padded = ((values.numel() + query_block - 1) // query_block) * query_block
+    if padded:
+        rows = torch.nn.functional.pad(values, (0, padded - values.numel()), value=-1)
+        maxima = rows.view(-1, query_block).amax(dim=1)
+        key_blocks = (maxima + key_block) // key_block
+        issued = int(key_blocks.sum()) * query_block * key_block
+    else:
+        issued = 0
+    full_issued = sum(
+        ((min(start + query_block, kv_tokens) + key_block - 1) // key_block)
+        * query_block
+        * key_block
+        for start in range(0, kv_tokens, query_block)
+    )
+    return {
+        "query_rows": values.numel(),
+        "retained_kv_rows": kv_tokens,
+        "mean_original_query_position": (
+            float(values.double().mean()) if values.numel() else None
+        ),
+        "valid_causal_qk_pairs_per_head": valid_pairs,
+        "full_causal_qk_pairs_per_head": full_pairs,
+        "valid_pair_fraction_vs_full_causal": valid_pairs / full_pairs,
+        "reference_query_block": query_block,
+        "reference_key_block": key_block,
+        "reference_issued_dot_slots_per_head": issued,
+        "full_reference_issued_dot_slots_per_head": full_issued,
+        "reference_tile_work_fraction": issued / full_issued,
+        "scope": "actual_positions_and_original_128x64_kernel_not_native_FA3_tiles",
+        "is_latency_prediction": False,
+    }
+
+
 def finish_audit(state):
     audit = state.token_audit
     if audit is None or audit.get("emitted"):
@@ -151,6 +203,15 @@ def finish_audit(state):
                 data = value.detach().to(device="cpu", dtype=torch.int64)
                 payload = data.contiguous().numpy().astype("<i8", copy=False).tobytes()
                 row[name + "_int64_le_sha256"] = hashlib.sha256(payload).hexdigest()
+                if name == "attention_positions" and row["layers"]:
+                    kv_tokens = row["layers"][-1]["attention_kv_tokens"]
+                    if data.numel() == row["layers"][-1]["attention_query_tokens"]:
+                        row["position_mask_work"] = position_mask_work(data, kv_tokens)
+                        row["position_mask_work"]["all_layers_share_geometry"] = all(
+                            layer["attention_kv_tokens"] == kv_tokens
+                            and layer["attention_query_tokens"] == data.numel()
+                            for layer in row["layers"]
+                        )
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, sort_keys=True) + "\n")
