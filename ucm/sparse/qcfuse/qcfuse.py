@@ -76,12 +76,23 @@ class QcFuse(UcmSparseBase):
         if self._attention_backend == "flex" and self._flex_key_block not in (64, 128):
             raise ValueError("QCFUSE_FLEX_KEY_BLOCK must be 64 or 128")
         self._attention_backend_counts = {"native": 0, "flex": 0}
+        reuse_metadata = os.environ.get("QCFUSE_REUSE_ATTN_METADATA", "0")
+        if reuse_metadata not in ("0", "1"):
+            raise ValueError("QCFUSE_REUSE_ATTN_METADATA must be 0 or 1")
+        self._reuse_attention_metadata = reuse_metadata == "1"
+        self._attention_metadata_builds = 0
+        self._attention_metadata_hits = 0
 
     def attention_backend_stats(self):
         return {
             "configured": self._attention_backend,
             "flex_key_block": self._flex_key_block,
             "layer_calls": dict(self._attention_backend_counts),
+            "metadata_reuse": {
+                "configured": getattr(self, "_reuse_attention_metadata", False),
+                "layout_builds": getattr(self, "_attention_metadata_builds", 0),
+                "layout_hits": getattr(self, "_attention_metadata_hits", 0),
+            },
         }
 
     def take_token_work(self):
@@ -505,16 +516,34 @@ class QcFuse(UcmSparseBase):
             return
         if hasattr(self, "_attention_backend_counts"):
             self._attention_backend_counts["native"] += 1
-        q_lens = torch.tensor(prepared.q_lens, dtype=torch.int32, device=device)
-        kv_lens = torch.tensor(prepared.kv_lens, dtype=torch.int32, device=device)
+        if getattr(self, "_reuse_attention_metadata", False):
+            builds, hits = (
+                self._step.attention_layout_builds,
+                self._step.attention_layout_hits,
+            )
+            q_starts, q_lens, kv_starts, kv_lens = self._step.attention_layout(
+                prepared.q_lens, prepared.kv_lens, device
+            )
+            self._attention_metadata_builds += (
+                self._step.attention_layout_builds - builds
+            )
+            self._attention_metadata_hits += self._step.attention_layout_hits - hits
+        else:
+            q_lens = torch.tensor(prepared.q_lens, dtype=torch.int32, device=device)
+            kv_lens = torch.tensor(prepared.kv_lens, dtype=torch.int32, device=device)
+            q_starts = cumulative_starts(prepared.q_lens, device)
+            kv_starts = cumulative_starts(prepared.kv_lens, device)
+            self._attention_metadata_builds = (
+                getattr(self, "_attention_metadata_builds", 0) + 1
+            )
         ragged_positions_attention_fwd(
             query,
             key,
             value,
             output,
-            cumulative_starts(prepared.q_lens, device),
+            q_starts,
             q_lens,
-            cumulative_starts(prepared.kv_lens, device),
+            kv_starts,
             kv_lens,
             prepared.q_positions,
             max(prepared.q_lens),

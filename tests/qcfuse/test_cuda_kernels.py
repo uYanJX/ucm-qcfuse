@@ -12,6 +12,79 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
+def test_attention_layout_cuda_reuse_preserves_ragged_output(batch):
+    from ucm.sparse.qcfuse.batch import QcFuseStepBatch, cumulative_starts
+    from ucm.sparse.qcfuse.ragged_attention import ragged_positions_attention_fwd
+
+    torch.manual_seed(1616 + batch)
+    step = QcFuseStepBatch()
+    keys = [11 + 3 * i for i in range(batch)]
+    k = torch.randn(sum(keys), 8, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    originals = [t.clone() for t in (k, v)]
+    for queries in (
+        [5 + i for i in range(batch)],
+        [3 + i for i in range(batch)],
+        [5 + i for i in range(batch)],
+    ):
+        q = torch.randn(sum(queries), 64, 128, device="cuda", dtype=torch.bfloat16)
+        positions = torch.cat(
+            [
+                torch.arange(n - length, n, device="cuda", dtype=torch.int32).flip(0)
+                for length, n in zip(queries, keys)
+            ]
+        )
+        expected, actual = torch.empty_like(q), torch.empty_like(q)
+        baseline = (
+            cumulative_starts(queries, q.device),
+            torch.tensor(queries, dtype=torch.int32, device=q.device),
+            cumulative_starts(keys, q.device),
+            torch.tensor(keys, dtype=torch.int32, device=q.device),
+        )
+        ragged_positions_attention_fwd(
+            q, k, v, expected, *baseline, positions, max(queries)
+        )
+        for _ in range(2):
+            metadata = step.attention_layout(queries, keys, q.device)
+            ragged_positions_attention_fwd(
+                q, k, v, actual, *metadata, positions, max(queries)
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(expected.view(torch.int16), actual.view(torch.int16))
+        assert all(torch.equal(a, b) for a, b in zip((k, v), originals))
+    assert step.attention_layout_builds == 2 and step.attention_layout_hits == 4
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_attention_layout_cuda_consumer_survives_owner_release(batch):
+    from ucm.sparse.qcfuse.batch import QcFuseStepBatch
+
+    producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    lengths = [3 + i for i in range(batch)]
+    keys = [11 + i for i in range(batch)]
+    step = QcFuseStepBatch()
+    with torch.cuda.stream(producer):
+        initial = step.attention_layout(lengths, keys, "cuda")
+    with torch.cuda.stream(consumer):
+        metadata = step.attention_layout(lengths, keys, "cuda")
+        torch.cuda._sleep(10_000_000)
+        copies = [t.clone() for t in metadata]
+    del step, initial, metadata
+    with torch.cuda.stream(producer):
+        pressure = [
+            torch.full((batch,), 999, dtype=torch.int32, device="cuda")
+            for _ in range(128)
+        ]
+    consumer.synchronize()
+    assert copies[0].tolist() == [sum(lengths[:i]) for i in range(batch)]
+    assert copies[1].tolist() == lengths
+    assert copies[2].tolist() == [sum(keys[:i]) for i in range(batch)]
+    assert copies[3].tolist() == keys
+    producer.synchronize()
+    del pressure
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
 def test_native_breakable_decode_keeps_eager_metadata_and_cuda_output(
     batch, monkeypatch
 ):

@@ -159,6 +159,17 @@ receipts record the configured tile budget separately.
 
 ## Position-based attention experiment
 
+`QCFUSE_REUSE_ATTN_METADATA=1` optionally reuses the native attention kernel's
+integer query/KV lengths and offsets within one scheduler step. The default
+is `0`. Compaction and critical-layer length changes select separate layouts;
+the next step owns fresh tensors. Cross-stream consumers wait for creation and
+record allocator ownership. Query positions, selected tokens, KV payloads and
+floating-point kernel arithmetic are unchanged. Benchmark worker snapshots
+expose layout build/hit counts under `attention_backend.metadata_reuse`.
+This reduces repeated metadata allocations and copies; use matched request
+timings to establish benefit rather than treating overlapping CPU sync time
+as additional latency that can all be removed.
+
 `QCFUSE_GPU_ATTENTION_BACKEND=flex` enables a compiled FlexAttention backend
 only for the DO_BLEND prefill pass. The default is `native`. It preserves
 original query positions, full cached KV lengths and `key_position <=

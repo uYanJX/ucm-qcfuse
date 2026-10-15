@@ -10,6 +10,22 @@ import torch
 from ucm.sparse.qcfuse.blend_info import BlendStyle, QcFuseRequestState
 
 
+@dataclass
+class _AttentionLayout:
+    tensors: tuple
+    producer: Optional[torch.cuda.Stream] = None
+    ready: Optional[torch.cuda.Event] = None
+
+    def consume(self):
+        if self.producer is not None:
+            current = torch.cuda.current_stream(self.tensors[0].device)
+            if current.cuda_stream != self.producer.cuda_stream:
+                current.wait_event(self.ready)
+            for tensor in self.tensors:
+                tensor.record_stream(current)
+        return self.tensors
+
+
 @dataclass(frozen=True)
 class QcFuseStepEntry:
     request_id: str
@@ -49,6 +65,50 @@ class QcFuseStepEntry:
 class QcFuseStepBatch:
     entries: List[QcFuseStepEntry] = field(default_factory=list)
     is_prefill: bool = False
+    _attention_layouts: Dict[tuple, _AttentionLayout] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    attention_layout_builds: int = field(
+        default=0, init=False, repr=False, compare=False
+    )
+    attention_layout_hits: int = field(default=0, init=False, repr=False, compare=False)
+
+    def attention_layout(self, q_lens, kv_lens, device):
+        """Reuse immutable integer metadata only within this scheduler step.
+
+        Host lengths form the key, including changes at projection compaction
+        or critical layers. A new step owns new tensors even for equal lengths.
+        Cross-stream consumers wait for creation and retain allocator ownership.
+        """
+        if isinstance(q_lens, torch.Tensor) or isinstance(kv_lens, torch.Tensor):
+            raise TypeError("attention_layout requires host length sequences")
+        queries, keys = tuple(map(int, q_lens)), tuple(map(int, kv_lens))
+        if len(queries) != len(keys):
+            raise ValueError("Query and KV layouts need equal request counts")
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        cache_key = (queries, keys, device)
+        layout = self._attention_layouts.get(cache_key)
+        if layout is None:
+            q_lengths = torch.tensor(queries, dtype=torch.int32, device=device)
+            kv_lengths = torch.tensor(keys, dtype=torch.int32, device=device)
+            tensors = (
+                cumulative_starts(queries, device),
+                q_lengths,
+                cumulative_starts(keys, device),
+                kv_lengths,
+            )
+            layout = _AttentionLayout(tensors)
+            if device.type == "cuda":
+                layout.producer = torch.cuda.current_stream(device)
+                layout.ready = torch.cuda.Event()
+                layout.ready.record(layout.producer)
+            self._attention_layouts[cache_key] = layout
+            self.attention_layout_builds += 1
+        else:
+            self.attention_layout_hits += 1
+        return layout.consume()
 
     @property
     def phase(self) -> Optional[BlendStyle]:

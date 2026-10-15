@@ -41,6 +41,52 @@ def test_decode_step_is_not_rewritten():
     assert batch.entries[0].is_decode
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_attention_layout_preserves_offsets_and_compaction(batch_size):
+    step = QcFuseStepBatch()
+    queries = [5 + i for i in range(batch_size)]
+    keys = [17 + 2 * i for i in range(batch_size)]
+    first = step.attention_layout(queries, keys, "cpu")
+    assert first[0].tolist() == [sum(queries[:i]) for i in range(batch_size)]
+    assert first[1].tolist() == queries
+    assert first[2].tolist() == [sum(keys[:i]) for i in range(batch_size)]
+    assert first[3].tolist() == keys
+    again = step.attention_layout(list(queries), tuple(keys), torch.device("cpu"))
+    assert all(a is b for a, b in zip(first, again))
+    compact = [n - 2 for n in queries]
+    changed = step.attention_layout(compact, keys, "cpu")
+    assert changed[1].tolist() == compact
+    assert changed[0].tolist() == [sum(compact[:i]) for i in range(batch_size)]
+    assert first[1].tolist() == queries
+    assert all(
+        a is b for a, b in zip(first, step.attention_layout(queries, keys, "cpu"))
+    )
+    assert step.attention_layout_builds == 2 and step.attention_layout_hits == 2
+
+
+def test_attention_layout_does_not_leak_between_steps_or_critical_kv_lengths():
+    first, next_step = QcFuseStepBatch(), QcFuseStepBatch()
+    digest = first.attention_layout([3, 4], [11, 13], "cpu")
+    critical = first.attention_layout([3, 4], [19, 23], "cpu")
+    assert digest[3].tolist() == [11, 13] and critical[3].tolist() == [19, 23]
+    assert critical[2].tolist() == [0, 19]
+    fresh = next_step.attention_layout([3, 4], [11, 13], "cpu")
+    assert all(a is not b for a, b in zip(digest, fresh))
+    assert next_step.attention_layout_hits == 0
+
+
+def test_attention_layout_empty_and_host_metadata_contract():
+    step = QcFuseStepBatch()
+    assert all(
+        t.numel() == 0 and t.dtype == torch.int32
+        for t in step.attention_layout([], [], "cpu")
+    )
+    with pytest.raises(ValueError, match="equal request counts"):
+        step.attention_layout([1, 2], [3], "cpu")
+    with pytest.raises(TypeError, match="host length sequences"):
+        step.attention_layout(torch.tensor([1]), [3], "cpu")
+
+
 def test_do_blend_reuses_qcompute_handoff():
     fuser = object.__new__(QcFuse)
     fuser._store = None
