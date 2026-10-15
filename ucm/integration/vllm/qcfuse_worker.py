@@ -66,6 +66,9 @@ class QcFuseWorkerExtension:
             "captured_token_counts": sorted({int(desc.num_tokens) for desc in graphs}),
             "eager_model_forwards": 0,
             "full_graph_replays": 0,
+            "piecewise_graph_replays": 0,
+            "piecewise_segment_replays": 0,
+            "piecewise_eager_break_calls": 0,
             "eager_input_token_histogram": {},
         }
 
@@ -93,6 +96,47 @@ class QcFuseWorkerExtension:
                 return output
 
             manager.run_fullgraph = replay
+            original_piecewise = getattr(manager, "run_pw_graph", None)
+            if callable(original_piecewise):
+
+                def observe_captures():
+                    wrapper = getattr(manager, "breakable_cg_runner", None)
+                    for entry in getattr(wrapper, "entries", {}).values():
+                        capture = getattr(entry, "capture", None)
+                        if capture is None or getattr(
+                            capture, "_ucm_qcfuse_replay_observed", False
+                        ):
+                            continue
+                        native_replay = capture.replay
+
+                        def captured_replay(_capture=capture, _replay=native_replay):
+                            _replay()
+                            state["piecewise_graph_replays"] += 1
+                            state["piecewise_segment_replays"] += int(
+                                _capture._num_graphs
+                            )
+                            state["piecewise_eager_break_calls"] += int(
+                                _capture._num_eager_breaks
+                            )
+
+                        capture.replay = captured_replay
+                        capture._ucm_qcfuse_replay_observed = True
+                        state["available"] = True
+                        desc = getattr(entry, "batch_descriptor", None)
+                        tokens = getattr(desc, "num_tokens", None)
+                        if tokens is not None:
+                            state["captured_token_counts"] = sorted(
+                                set(state["captured_token_counts"] + [int(tokens)])
+                            )
+
+                def piecewise(*args, **kwargs):
+                    observe_captures()
+                    output = original_piecewise(*args, **kwargs)
+                    observe_captures()
+                    return output
+
+                manager.run_pw_graph = piecewise
+                observe_captures()
         return dict(state)
 
     def qcfuse_memory_breakdown(self):

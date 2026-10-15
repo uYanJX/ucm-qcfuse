@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ucm.integration.vllm.qcfuse_graph import install_v2_graph_hooks
+from ucm.integration.vllm.qcfuse_graph import (
+    decode_graph_compilation_config,
+    install_v2_graph_hooks,
+)
 from ucm.integration.vllm.qcfuse_worker import QcFuseWorkerExtension
 
 
@@ -170,3 +173,59 @@ def test_zero_token_cleanup_does_not_require_forward_context(monkeypatch):
     runner.kv_connector.pre_forward(scheduler)
     assert events == ["bind"]
     assert runner._ucm_latest_sparse_meta_built_for is None
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_piecewise_options_keep_compile_disabled_and_bound_capture(batch):
+    config = decode_graph_compilation_config("piecewise", batch)
+    assert config["mode"] == 0
+    assert config["cudagraph_mode"] == "PIECEWISE"
+    assert config["cudagraph_capture_sizes"] == list(range(1, batch + 1))
+    assert config["max_cudagraph_capture_size"] == batch
+    assert (
+        decode_graph_compilation_config("full", batch)["cudagraph_mode"]
+        == "FULL_DECODE_ONLY"
+    )
+
+
+@pytest.mark.parametrize("mode,batch", [("compiled", 1), ("full", True), ("full", 0)])
+def test_invalid_decode_graph_configuration_is_rejected(mode, batch):
+    with pytest.raises(ValueError):
+        decode_graph_compilation_config(mode, batch)
+
+
+def test_piecewise_observer_counts_actual_replay_and_lazy_entries():
+    events = []
+    capture = SimpleNamespace(
+        replay=lambda: events.append("real-replay"), _num_graphs=2, _num_eager_breaks=1
+    )
+    entries = {}
+    manager = SimpleNamespace(
+        graphs={}, cudagraph_mode="PIECEWISE", run_fullgraph=lambda _: None
+    )
+    manager.breakable_cg_runner = SimpleNamespace(entries=entries)
+
+    def run_piecewise(*args):
+        if not entries:
+            entries[1] = SimpleNamespace(
+                capture=capture, batch_descriptor=SimpleNamespace(num_tokens=1)
+            )
+        else:
+            capture.replay()
+
+    manager.run_pw_graph = run_piecewise
+    worker = QcFuseWorkerExtension()
+    worker.model_runner = SimpleNamespace(
+        model=torch.nn.Identity(), cudagraph_manager=manager
+    )
+    worker.qcfuse_start_execution_mode_observer()
+    manager.run_pw_graph(None)
+    assert worker._qcfuse_execution_modes["piecewise_graph_replays"] == 0
+    manager.run_pw_graph(None)
+    manager.run_pw_graph(None)
+    assert events == ["real-replay", "real-replay"]
+    state = worker._qcfuse_execution_modes
+    assert state["piecewise_graph_replays"] == 2
+    assert state["piecewise_segment_replays"] == 4
+    assert state["piecewise_eager_break_calls"] == 2
+    assert state["captured_token_counts"] == [1]

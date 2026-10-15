@@ -11,6 +11,67 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_native_breakable_decode_keeps_eager_metadata_and_cuda_output(
+    batch, monkeypatch
+):
+    from types import SimpleNamespace
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, set_forward_context
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    torch.manual_seed(1610 + batch)
+    first = torch.nn.Linear(64, 64, bias=False).cuda().to(torch.bfloat16)
+    second = torch.nn.Linear(64, 32, bias=False).cuda().to(torch.bfloat16)
+    inputs = torch.randn(batch, 64, device="cuda", dtype=torch.bfloat16)
+    scratch = torch.empty_like(inputs)
+
+    @eager_break_during_capture
+    def attention_break(value, output):
+        bound = get_forward_context().attn_metadata["toy"].max_seq_len
+        output.copy_(value * float(bound))
+
+    def forward():
+        attention_break(first(inputs), scratch)
+        return second(scratch)
+
+    config = VllmConfig()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with set_current_vllm_config(config):
+        with (
+            torch.cuda.stream(capture_stream),
+            set_forward_context(
+                {"toy": SimpleNamespace(max_seq_len=3)},
+                config,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ),
+        ):
+            for _ in range(3):
+                forward()
+            torch.cuda.synchronize()
+            capture = BreakableCUDAGraphCapture()
+            with capture:
+                actual = forward()
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        assert capture._num_graphs == 2 and capture._num_eager_breaks == 1
+        for bound in (3, 7, 3):
+            with set_forward_context(
+                {"toy": SimpleNamespace(max_seq_len=bound)},
+                config,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ):
+                capture.replay()
+            expected = second(first(inputs) * float(bound))
+            torch.cuda.synchronize()
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("key_block", [64, 128])
 def test_flex_attention_cuda_preserves_masks_and_repeated_request_ownership(

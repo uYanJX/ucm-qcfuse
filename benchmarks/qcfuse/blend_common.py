@@ -214,6 +214,7 @@ class BlendEngineBase:
         block_size: int = 512,
         rope_factor: Optional[float] = 4.0,
         decode_cudagraph: bool = False,
+        decode_cudagraph_mode: str = "full",
         **engine_kwargs,
     ):
         if batch_size < 1:
@@ -232,6 +233,17 @@ class BlendEngineBase:
         self.attn_end = -1
         self.critical_layers = None
         self._model_config = None
+        if decode_cudagraph_mode not in ("full", "piecewise"):
+            raise ValueError("decode_cudagraph_mode must be full or piecewise")
+        if decode_cudagraph and decode_cudagraph_mode == "piecewise":
+            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+        from ucm.integration.vllm.qcfuse_graph import decode_graph_compilation_config
+
+        graph_config = decode_graph_compilation_config(
+            decode_cudagraph_mode, self.batch_size
+        )
+        # Enable before importing vLLM: native attention break decorators are
+        # selected at module import. Fresh model workers inherit the switch.
 
         # The multiprocess EngineCore can begin the first large request while
         # the next request is still crossing IPC. Inproc queues the complete
@@ -303,12 +315,7 @@ class BlendEngineBase:
         if decode_cudagraph:
             engine_options.update(
                 enforce_eager=False,
-                compilation_config={
-                    "mode": 0,
-                    "cudagraph_mode": "FULL_DECODE_ONLY",
-                    "cudagraph_capture_sizes": list(range(1, self.batch_size + 1)),
-                    "max_cudagraph_capture_size": self.batch_size,
-                },
+                compilation_config=graph_config,
             )
         if os.getenv("QCFUSE_DISABLE_FLASHINFER_AUTOTUNE", "0") == "1":
             # FlashInfer's startup autotune allocates a transient workspace

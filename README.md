@@ -58,6 +58,15 @@ export ENABLE_UCM_PATCH=1
 export ENABLE_SPARSE=1
 ```
 
+The frozen runner accepts `--decode-cudagraph piecewise` as an opt-in native
+breakable decode path, with torch.compile disabled. Attention executes eagerly
+with each step's actual metadata while the surrounding operations replay CUDA
+graph segments. Sparse prefill remains eager. This is useful when full capture
+changes FA2's length bound and therefore its numerical execution path. Validate
+outputs and latency on the target device before adoption; `off` remains the
+default, and `on` retains the full decode graph option. Worker snapshots report
+actual piecewise model and segment replays separately from full graph replays.
+
 `ENABLE_UCM_PATCH` is the upstream name for runtime hook activation; it does
 not mean applying an external patch file. Benchmark runners configure the
 QCFuse connector and worker extension automatically.

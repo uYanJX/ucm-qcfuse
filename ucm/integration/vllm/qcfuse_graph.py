@@ -1,6 +1,24 @@
 """Keep QCFuse prefill eager and refresh V2 state before native graph replay."""
 
 
+def decode_graph_compilation_config(mode, batch_size):
+    """Use native decode graphs without compiling sparse prefill arithmetic."""
+    if mode not in ("full", "piecewise"):
+        raise ValueError("decode_cudagraph_mode must be full or piecewise")
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size < 1
+    ):
+        raise ValueError("batch_size must be a positive integer")
+    return {
+        "mode": 0,
+        "cudagraph_mode": "PIECEWISE" if mode == "piecewise" else "FULL_DECODE_ONLY",
+        "cudagraph_capture_sizes": list(range(1, batch_size + 1)),
+        "max_cudagraph_capture_size": batch_size,
+    }
+
+
 def build_v2_sparse_meta(runner, scheduler, attn_metadata, has_sparse, get_sparse):
     if (
         scheduler is not None

@@ -276,6 +276,7 @@ class SSDPipelineEngine(BlendEngineBase):
         gpu_resident_codec: Optional[str] = None,
         gpu_query_alias: bool = False,
         decode_cudagraph: bool = False,
+        decode_cudagraph_mode: str = "full",
     ):
         # The base constructor reads this through _kv_connector_extra_config().
         self.cache_dir = cache_dir
@@ -302,6 +303,7 @@ class SSDPipelineEngine(BlendEngineBase):
             rope_factor=rope_factor,
             kv_cache_memory_bytes=kv_cache_memory_bytes,
             decode_cudagraph=decode_cudagraph,
+            decode_cudagraph_mode=decode_cudagraph_mode,
         )
         self.context_enhance = context_enhance
         self.context_n_sink = DEFAULT_CONTEXT_N_SINK
