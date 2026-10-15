@@ -119,3 +119,45 @@ def test_host_counts_keep_actual_work_without_events_or_files(monkeypatch):
 
 def test_token_observer_remains_disabled_by_default():
     assert new_audit(None, "DO_BLEND_FINISH", 0.4, 0, [0, 2, 19, 22]) is None
+
+
+def test_diagnostic_hashes_actual_selection_order_and_positions(tmp_path):
+    import hashlib
+
+    selected = torch.tensor([5, 2, 19, 20, 21])
+    state = QcFuseRequestState(
+        request_id="audit",
+        ratio=0.4,
+        blend_top_indices=selected,
+        positions=selected.clone(),
+        attention_positions=selected.to(torch.int32),
+        token_audit=new_audit(
+            tmp_path / "selection.jsonl", "DO_BLEND_FINISH", 0.4, 0, [0, 2, 19, 22]
+        ),
+    )
+    row = finish_audit(state)
+    expected = hashlib.sha256(selected.numpy().astype("<i8").tobytes()).hexdigest()
+    for name in ("selected_indices", "positions", "attention_positions"):
+        assert row[name + "_int64_le_sha256"] == expected
+    assert (
+        expected
+        != hashlib.sha256(
+            selected.sort().values.numpy().astype("<i8").tobytes()
+        ).hexdigest()
+    )
+
+
+def test_counts_only_does_not_copy_selection_to_host(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Formal counts-only timing copied selection to host")
+
+    state = QcFuseRequestState(
+        request_id="counts",
+        ratio=0.4,
+        blend_top_indices=torch.tensor([2, 3, 19, 20, 21]),
+        token_audit=new_audit(
+            None, "DO_BLEND_FINISH", 0.4, 0, [0, 2, 19, 22], counts_only=True
+        ),
+    )
+    monkeypatch.setattr(torch.Tensor, "to", forbidden)
+    assert not any("sha256" in key for key in finish_audit(state))

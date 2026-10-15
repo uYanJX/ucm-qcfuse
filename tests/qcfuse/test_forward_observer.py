@@ -124,6 +124,43 @@ def test_non_capacity_rpc_failure_is_not_tagged_as_unsupported_input(tmp_path):
     assert not isinstance(raised.value, GpuResidentPreloadCapacityError)
 
 
+def test_resident_runner_passes_explicit_codec_and_query_pair(tmp_path):
+    sys.path.insert(0, str(Path(__file__).parents[2] / "benchmarks" / "qcfuse"))
+    from blend_ssd import SSDPipelineEngine
+
+    chunk, query = tmp_path / "chunk", tmp_path / "query"
+    chunk.mkdir()
+    query.mkdir()
+    source, digest = chunk / "kv_packed.bin", query / "query_packed.bin"
+    source.write_bytes(b"source")
+    digest.write_bytes(b"query")
+    engine = object.__new__(SSDPipelineEngine)
+    engine.storage_mode, engine.baseline = "gpu", "ours"
+    engine.gpu_resident_codec, engine.gpu_query_alias = "ans_f16_bits", True
+    calls = []
+    engine.llm = SimpleNamespace(
+        collective_rpc=lambda name, **kwargs: calls.append((name, kwargs)) or []
+    )
+    sample = SimpleNamespace(
+        sample_dir_chunk=chunk, sample_dir_query=query, input_tokens=11
+    )
+    engine._prepare_resident_batch([sample])
+    assert calls == [
+        (
+            "qcfuse_prepare_resident_batch",
+            {
+                "args": (
+                    sorted([str(source), str(digest)]),
+                    "gpu",
+                    0,
+                    "ans_f16_bits",
+                    {str(digest): str(source)},
+                )
+            },
+        )
+    ]
+
+
 def test_snapshot_adds_cumulative_transfer_metrics_without_gpu_timing(monkeypatch):
     from ucm.store.qcfuse import transfer
     from ucm.sparse import state

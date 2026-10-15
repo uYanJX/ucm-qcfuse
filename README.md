@@ -28,6 +28,11 @@ pool. A model/context fitting full prefill does not guarantee that GPU-resident
 fusion fits. CPU/SSD modes provide bounded layer staging. The runner reports
 capacity failures rather than silently truncating inputs or changing precision.
 
+Optional GPU residency can store BF16 KV as losslessly encoded bytes and
+materialize query KV from the same explicitly paired source. The packed
+pre-RoPE disk format, token selection and attention computation are unchanged.
+Decoding returns request-owned tensors; fusion never mutates resident sources.
+
 Old post-RoPE caches must be rebuilt. Other UCM integrations are retained as
 upstream source, but this branch's QCFuse support statement covers the runtime
 above; historical external patch bundles are not distributed.
@@ -63,10 +68,22 @@ See [the evaluation guide](benchmarks/qcfuse/README.md) for frozen manifests,
 quality runs, repeated timing, cold/warm storage and cleanup behavior.
 Models, datasets and experiment outputs are supplied locally.
 
+For a matching CUDA 13 runtime, optional lossless residency was tested with
+`nvidia-nvcomp-cu13==6.0.0.12` (and its matching library dependency). Install it
+separately, then add `--storage gpu --gpu-resident-codec ans_f16_bits
+--gpu-query-alias on` to the frozen runner. The codec reinterprets BF16 words as
+16-bit symbols without a numerical conversion. Query/source byte equivalence
+is verified during preload; online loads decode and gather exclusively on
+GPU. Preload is reported separately, and online decoding remains inside TTFT.
+These switches are opt-in; uncompressed GPU, CPU and SSD defaults are retained.
+Capacity and end-to-end speed must be measured for the actual model and inputs.
+
 ```bash
 PYTHONPATH="$PWD" python -m pytest -q tests/qcfuse -k 'not cuda'
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD" \
   python -m pytest -q tests/qcfuse/test_cuda_kernels.py
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD" \
+  python -m pytest -q tests/qcfuse/test_resident_codec.py
 ```
 
 Set `QCFUSE_REFERENCE_DIR` to a local checkout of the pinned QCFuse reference

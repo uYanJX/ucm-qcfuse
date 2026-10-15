@@ -137,6 +137,20 @@ def finish_audit(state):
     path = audit["path"]
     row["observation_mode"] = "cuda_event_audit" if path else "host_shape_counts"
     if path:
+        # Explicit diagnostics only: hash actual order and positions. Formal
+        # counts-only timing must never synchronize or copy these tensors.
+        import hashlib
+        import torch
+
+        for name, value in (
+            ("selected_indices", state.blend_top_indices),
+            ("positions", state.positions),
+            ("attention_positions", state.attention_positions),
+        ):
+            if value is not None:
+                data = value.detach().to(device="cpu", dtype=torch.int64)
+                payload = data.contiguous().numpy().astype("<i8", copy=False).tobytes()
+                row[name + "_int64_le_sha256"] = hashlib.sha256(payload).hexdigest()
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, sort_keys=True) + "\n")

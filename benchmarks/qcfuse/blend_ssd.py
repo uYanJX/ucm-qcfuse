@@ -273,10 +273,18 @@ class SSDPipelineEngine(BlendEngineBase):
         kv_cache_memory_bytes: Optional[int] = None,
         gpu_headroom_bytes_per_token: int = 0,
         gpu_headroom_fixed_bytes: int = 0,
+        gpu_resident_codec: Optional[str] = None,
+        gpu_query_alias: bool = False,
     ):
         # The base constructor reads this through _kv_connector_extra_config().
         self.cache_dir = cache_dir
         self.storage_mode = storage_mode
+        if (gpu_resident_codec or gpu_query_alias) and (
+            storage_mode != "gpu" or baseline == "fullcomp"
+        ):
+            raise ValueError("Lossless residency options require a GPU cached method")
+        self.gpu_resident_codec = gpu_resident_codec
+        self.gpu_query_alias = gpu_query_alias
         if gpu_headroom_bytes_per_token < 0 or gpu_headroom_fixed_bytes < 0:
             raise ValueError("GPU headroom per token must be nonnegative")
         self.gpu_headroom_bytes_per_token = gpu_headroom_bytes_per_token
@@ -688,6 +696,11 @@ class SSDPipelineEngine(BlendEngineBase):
                 "do_blend_ttft_seconds": result["do_blend_ttft"],
                 "latency_seconds": result["latency"],
                 "generated_tokens": result["generated_tokens"],
+                "output_token_ids_sha256": hashlib.sha256(
+                    json.dumps(
+                        result["output_token_ids"], separators=(",", ":")
+                    ).encode()
+                ).hexdigest(),
                 "decode_tokens": result["decode_tokens"],
                 "first_token_output_tokens": result["first_token_output_tokens"],
                 "ruler_task": sample.ruler_task,
@@ -741,9 +754,24 @@ class SSDPipelineEngine(BlendEngineBase):
             else 0
         )
         try:
+            args = (paths, self.storage_mode, headroom_bytes)
+            gpu_codec = getattr(self, "gpu_resident_codec", None)
+            gpu_alias = getattr(self, "gpu_query_alias", False)
+            if gpu_codec or gpu_alias:
+                pairs = (
+                    {
+                        str(Path(sample.sample_dir_query) / "query_packed.bin"): str(
+                            Path(sample.sample_dir_chunk) / "kv_packed.bin"
+                        )
+                        for sample in samples
+                    }
+                    if gpu_alias
+                    else {}
+                )
+                args += (gpu_codec, pairs)
             workers = self.llm.collective_rpc(
                 "qcfuse_prepare_resident_batch",
-                args=(paths, self.storage_mode, headroom_bytes),
+                args=args,
             )
         except Exception as exc:
             if self.storage_mode == "gpu" and "cuda out of memory" in str(exc).lower():

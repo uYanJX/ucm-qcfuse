@@ -2,10 +2,14 @@
 
 
 class QcFuseWorkerExtension:
-    def qcfuse_prepare_resident_batch(self, paths, mode, online_headroom_bytes=0):
+    def qcfuse_prepare_resident_batch(
+        self, paths, mode, online_headroom_bytes=0, gpu_codec=None, query_sources=None
+    ):
         from ucm.store.qcfuse.transfer import prepare_resident_batch
 
-        return prepare_resident_batch(self, paths, mode, online_headroom_bytes)
+        return prepare_resident_batch(
+            self, paths, mode, online_headroom_bytes, gpu_codec, query_sources
+        )
 
     def qcfuse_benchmark_snapshot(self, reset_peak=False):
         from ucm.store.qcfuse.transfer import benchmark_snapshot

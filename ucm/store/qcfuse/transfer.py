@@ -56,6 +56,8 @@ class _ResidentReader:
         self.pinned = bool(pinned)
         self.registered = False
         self.size = int(tensor.numel())
+        self.logical_size = self.size
+        self.codec = None
         # Keep one byte view for the lifetime of a CPU resident reader.  The
         # previous path rebuilt a NumPy/memoryview wrapper for every layer,
         # which added Python overhead to the CPU-resident pipeline.  GPU
@@ -66,6 +68,14 @@ class _ResidentReader:
 
     def advise(self, _offset: int, _length: int) -> None:
         return
+
+    def owned_tensor(self, item):
+        return (
+            self.tensor[item["offset"] : item["offset"] + item["nbytes"]]
+            .view(item["dtype"])
+            .view(item["shape"])
+            .clone()
+        )
 
     def read_into(
         self,
@@ -178,7 +188,9 @@ def _try_register_host_memory(tensor: torch.Tensor) -> bool:
     return True
 
 
-def preload_resident_file(path: str, mode: str, device: str = "cuda:0") -> int:
+def preload_resident_file(
+    path: str, mode: str, device: str = "cuda:0", gpu_codec=None
+) -> int:
     """Load one packed file into CPU pinned memory or GPU memory.
 
     This is intentionally an explicit preload operation.  Benchmark runners
@@ -192,6 +204,17 @@ def preload_resident_file(path: str, mode: str, device: str = "cuda:0") -> int:
     with _RESIDENT_LOCK:
         if path in _RESIDENT_FILES:
             return _RESIDENT_FILES[path].size
+    if gpu_codec is not None:
+        if mode != "gpu" or gpu_codec != "ans_f16_bits":
+            raise ValueError("Unsupported GPU resident codec")
+        from ucm.store.qcfuse.resident_codec import CompressedResidentReader
+
+        reader = CompressedResidentReader(path, device)
+        with _RESIDENT_LOCK:
+            existing = _RESIDENT_FILES.setdefault(path, reader)
+        if existing is not reader:
+            reader.close()
+        return existing.size
     size = os.path.getsize(path)
     registered = False
     pinned = False
@@ -248,7 +271,9 @@ def resident_reader(path: str) -> Optional[_ResidentReader]:
         return _RESIDENT_FILES.get(os.fspath(path))
 
 
-def prepare_resident_batch(worker, paths, mode, online_headroom_bytes=0):
+def prepare_resident_batch(
+    worker, paths, mode, online_headroom_bytes=0, gpu_codec=None, query_sources=None
+):
     """vLLM worker control RPC; load only the active batch outside its timer.
 
     Call between completed requests. Synchronization makes host unregister and
@@ -260,10 +285,30 @@ def prepare_resident_batch(worker, paths, mode, online_headroom_bytes=0):
     if online_headroom_bytes < 0:
         raise ValueError("Online GPU headroom must be nonnegative")
     paths = [os.fspath(path) for path in paths]
+    query_sources = {
+        os.fspath(query): os.fspath(source)
+        for query, source in (query_sources or {}).items()
+    }
+    if gpu_codec not in (None, "ans_f16_bits"):
+        raise ValueError("Unsupported GPU resident codec")
+    if mode != "gpu" and (gpu_codec or query_sources):
+        raise ValueError("Compressed residency and query aliases require GPU mode")
+    if any(
+        query not in paths or source not in paths or source in query_sources
+        for query, source in query_sources.items()
+    ):
+        raise ValueError("Query aliases require distinct explicit sources in the batch")
     started = time.perf_counter()
     with _RESIDENT_LOCK:
         unchanged = set(paths) == set(_RESIDENT_FILES) and all(
-            reader.mode == mode for reader in _RESIDENT_FILES.values()
+            reader.mode == mode
+            and (
+                getattr(reader, "source_path", None) == query_sources[path]
+                if path in query_sources
+                else getattr(reader, "codec", None) == gpu_codec
+                and not hasattr(reader, "source_path")
+            )
+            for path, reader in _RESIDENT_FILES.items()
         )
     if not unchanged:
         if torch.cuda.is_available():
@@ -271,8 +316,33 @@ def prepare_resident_batch(worker, paths, mode, online_headroom_bytes=0):
         release_resident_files()
     try:
         if not unchanged:
+            bindings = {}
+            if query_sources:
+                from ucm.store.qcfuse.resident_codec import (
+                    QueryAliasReader,
+                    validate_query_alias,
+                )
+
+                # Prove equivalence before committing any GPU payloads.
+                bindings = {
+                    query: validate_query_alias(query, source)
+                    for query, source in query_sources.items()
+                }
             for path in paths:
-                preload_resident_file(path, mode)
+                if path not in query_sources:
+                    if gpu_codec:
+                        preload_resident_file(path, mode, gpu_codec=gpu_codec)
+                    else:
+                        preload_resident_file(path, mode)
+            for query, source in query_sources.items():
+                reader = QueryAliasReader(
+                    query, source, resident_reader(source), bindings[query], "cuda:0"
+                )
+                with _RESIDENT_LOCK:
+                    _RESIDENT_FILES[query] = reader
+            if mode == "gpu" and paths:
+                # Include index uploads in explicit preload, before online TTFT.
+                torch.cuda.synchronize()
         if mode == "gpu" and paths and online_headroom_bytes:
             # A raw cache that fits can still starve selection/FFN workspace.
             # Probe capacity before request submission; a failure rolls back
@@ -295,6 +365,8 @@ def prepare_resident_batch(worker, paths, mode, online_headroom_bytes=0):
         "resident_prepare_seconds": time.perf_counter() - started,
         "resident_batch_reused": unchanged,
         "online_headroom_bytes": online_headroom_bytes if mode == "gpu" else 0,
+        "gpu_resident_codec": gpu_codec,
+        "gpu_query_aliases": len(query_sources),
     }
 
 
@@ -319,6 +391,18 @@ def resident_metrics() -> Dict[str, int]:
             "resident_files": len(_RESIDENT_FILES),
             "resident_cpu_bytes": cpu_bytes,
             "resident_gpu_bytes": gpu_bytes,
+            "resident_gpu_logical_bytes": sum(
+                item.logical_size
+                for item in _RESIDENT_FILES.values()
+                if item.mode == "gpu"
+            ),
+            "resident_gpu_compressed_files": sum(
+                getattr(item, "codec", None) is not None
+                for item in _RESIDENT_FILES.values()
+            ),
+            "resident_gpu_query_aliases": sum(
+                hasattr(item, "source_path") for item in _RESIDENT_FILES.values()
+            ),
             "resident_cpu_pinned": sum(
                 1
                 for item in _RESIDENT_FILES.values()
@@ -892,20 +976,6 @@ class TransferPool:
             if resident is not None and resident.mode == "gpu":
                 k_item = meta_item_resolver(layer_id, "k")
                 v_item = meta_item_resolver(layer_id, "v")
-                k_gpu = (
-                    resident.tensor[
-                        k_item["offset"] : k_item["offset"] + k_item["nbytes"]
-                    ]
-                    .view(k_item["dtype"])
-                    .view(k_item["shape"])
-                )
-                v_gpu = (
-                    resident.tensor[
-                        v_item["offset"] : v_item["offset"] + v_item["nbytes"]
-                    ]
-                    .view(v_item["dtype"])
-                    .view(v_item["shape"])
-                )
                 self._last_operation_metrics = {
                     "ssd_read_seconds": 0.0,
                     "ssd_read_bytes": 0.0,
@@ -919,7 +989,7 @@ class TransferPool:
                 # RoPE and index_copy_ in blender mutate the returned tensors.
                 # Each request must own its repair buffers; exposing registry
                 # views corrupts the next warmup/request's pre-RoPE cache.
-                result = k_gpu.clone(), v_gpu.clone()
+                result = resident.owned_tensor(k_item), resident.owned_tensor(v_item)
                 ready = torch.cuda.Event(enable_timing=False)
                 ready.record(torch.cuda.current_stream(device=self.device))
                 return _attach_ready_event(result, ready)
