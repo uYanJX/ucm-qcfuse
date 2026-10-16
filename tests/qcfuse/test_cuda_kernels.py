@@ -2,6 +2,7 @@ import importlib.util
 import math
 import os
 from pathlib import Path
+import weakref
 
 import pytest
 import torch
@@ -1031,8 +1032,9 @@ def test_ragged_attention_matches_torch_for_unequal_batches(batch_size):
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-3)
 
 
+@pytest.mark.parametrize("release_unrelated", [False, True])
 def test_failed_resident_gpu_batch_releases_partial_allocation_and_can_retry(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, release_unrelated
 ):
     from ucm.store.qcfuse import transfer
 
@@ -1042,8 +1044,10 @@ def test_failed_resident_gpu_batch_releases_partial_allocation_and_can_retry(
     second.write_bytes(bytes(range(64)))
     transfer.release_resident_files()
     torch.cuda.synchronize()
+    unrelated = [torch.empty(1024, device="cuda")] if release_unrelated else []
     initial_allocated = torch.cuda.memory_allocated()
     original_to = torch.Tensor.to
+    partial_allocations = []
 
     def fail_second_copy(tensor, *args, **kwargs):
         if (
@@ -1051,8 +1055,12 @@ def test_failed_resident_gpu_batch_releases_partial_allocation_and_can_retry(
             and tensor.numel() == 64
             and kwargs.get("device") == "cuda:0"
         ):
+            unrelated.clear()
             raise RuntimeError("Injected CUDA out of memory during resident preload")
-        return original_to(tensor, *args, **kwargs)
+        result = original_to(tensor, *args, **kwargs)
+        if tensor.device.type == "cpu" and result.device.type == "cuda":
+            partial_allocations.append(weakref.ref(result))
+        return result
 
     monkeypatch.setattr(torch.Tensor, "to", fail_second_copy)
     try:
@@ -1061,7 +1069,10 @@ def test_failed_resident_gpu_batch_releases_partial_allocation_and_can_retry(
         torch.cuda.synchronize()
         assert transfer.resident_metrics()["resident_files"] == 0
         assert transfer.resident_metrics()["resident_gpu_bytes"] == 0
-        assert torch.cuda.memory_allocated() == initial_allocated
+        assert partial_allocations and all(ref() is None for ref in partial_allocations)
+        # Other request-local tensors may be freed while rolling back. Verify
+        # this batch's objects and forbid net growth, rather than global equality.
+        assert torch.cuda.memory_allocated() <= initial_allocated
 
         retried = transfer.prepare_resident_batch(None, [str(first)], "gpu")
         assert retried["resident_files"] == 1
