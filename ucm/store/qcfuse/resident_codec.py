@@ -36,6 +36,24 @@ def _codec(device, stream):
     )
 
 
+def _read_payload_into(source, offset, destination):
+    """Fill reusable host bytes, including readers that return short reads."""
+    target = None
+    try:
+        source.seek(offset)
+        target = memoryview(destination).cast("B")
+        filled = 0
+        while filled < len(target):
+            count = source.readinto(target[filled:])
+            if not count:
+                raise EOFError("Incomplete lossless GPU preload")
+            filled += count
+    finally:
+        if target is not None:
+            target.release()
+        destination = None  # A retained exception must not pin the input buffer.
+
+
 class CompressedResidentReader:
     """Store immutable byte payloads; decode only into request-owned tensors.
 
@@ -87,19 +105,28 @@ class CompressedResidentReader:
         nvcomp = _nvcomp_module()
         staging = []
         raw = encoded = encoded_view = view = None
+        host = host_bytes = None
         try:
+            # A bounded reusable input replaces read()'s bytes object and the
+            # following NumPy copy. The stream is synchronized before this
+            # buffer is filled again. The reader retains no input tensor after
+            # preload. Keep the compact output slab construction unchanged.
+            input_bytes = max((item["nbytes"] for item in items), default=0)
+            try:
+                host = torch.empty(input_bytes, dtype=torch.uint8, pin_memory=True)
+            except RuntimeError:
+                host = torch.empty(input_bytes, dtype=torch.uint8)
+            host_bytes = host.numpy()
             with open(path, "rb", buffering=0) as source:
                 for item in items:
                     if item["dtype"] != torch.bfloat16:
                         raise ValueError("ans_f16_bits residency requires BF16 KV")
                     if not item["nbytes"]:
                         continue
-                    source.seek(item["offset"])
-                    data = source.read(item["nbytes"])
-                    if len(data) != item["nbytes"]:
-                        raise EOFError("Incomplete lossless GPU preload")
-                    host = torch.from_numpy(np.frombuffer(data, dtype=np.uint8).copy())
-                    raw = host.to(self.device)
+                    _read_payload_into(
+                        source, item["offset"], host_bytes[: item["nbytes"]]
+                    )
+                    raw = host[: item["nbytes"]].to(self.device)
                     config = configs.get(item["nbytes"])
                     if config is None:
                         config = encoder.compression_config(item["nbytes"])
@@ -127,8 +154,9 @@ class CompressedResidentReader:
                     payload = encoded_view[:used_bytes].to(device="cpu", copy=True)
                     stream.synchronize()
                     staging.append((item_key(item), payload))
-                    del encoded_view, encoded, raw, host, data
+                    del encoded_view, encoded, raw
                     raw = encoded = encoded_view = None
+            host = host_bytes = None
             decoder_sizes = tuple(configs)
             configs.clear()
             config = encoder = None
@@ -155,6 +183,7 @@ class CompressedResidentReader:
         except BaseException:
             # Exception tracebacks must not retain a view of the whole slab.
             raw = encoded = encoded_view = view = None
+            host = host_bytes = None
             config = encoder = None
             configs.clear()
             staging.clear()
