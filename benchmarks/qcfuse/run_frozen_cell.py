@@ -275,6 +275,7 @@ def main():
             "gpu_ffn_projection_tile_tokens": int(
                 os.getenv("QCFUSE_GPU_FFN_TILE_TOKENS", "0")
             ),
+            "prefill_memory_policy": os.getenv("QCFUSE_PREFILL_MEMORY_POLICY", "auto"),
             "reuse_attention_metadata": os.getenv("QCFUSE_REUSE_ATTN_METADATA", "0")
             == "1",
         },

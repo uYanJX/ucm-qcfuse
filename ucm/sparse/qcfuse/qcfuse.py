@@ -77,6 +77,11 @@ class QcFuse(UcmSparseBase):
             raise ValueError("QCFUSE_FLEX_KEY_BLOCK must be 64 or 128")
         self._attention_backend_counts = {"native": 0, "flex": 0}
         self._tma_fallback_counts = {}
+        self._prefill_memory_policy = os.environ.get(
+            "QCFUSE_PREFILL_MEMORY_POLICY", "auto"
+        )
+        if self._prefill_memory_policy not in ("auto", "compact"):
+            raise ValueError("QCFUSE_PREFILL_MEMORY_POLICY must be auto or compact")
         reuse_metadata = os.environ.get("QCFUSE_REUSE_ATTN_METADATA", "0")
         if reuse_metadata not in ("0", "1"):
             raise ValueError("QCFUSE_REUSE_ATTN_METADATA must be 0 or 1")
@@ -227,12 +232,45 @@ class QcFuse(UcmSparseBase):
     # Qwen3 pre-RoPE integration
     # ------------------------------------------------------------------
     def compact_projection_values(self) -> bool:
-        """Release the fused projection backing store before GPU KV loading."""
+        """Select compact prefill independently of residency when requested."""
         return (
             self._step.active
             and self._step.phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH)
-            and getattr(self._store, "storage_mode", None) == "gpu"
+            and (
+                getattr(self, "_prefill_memory_policy", "auto") == "compact"
+                or getattr(self._store, "storage_mode", None) == "gpu"
+            )
         )
+
+    def _ensure_prefill_counters(self):
+        if not hasattr(self, "_prefill_counters"):
+            self._prefill_counters = {
+                kind: {"calls": 0, "rows": 0}
+                for kind in ("qkv_values", "ffn_layer", "ffn_tile")
+            }
+            self._prefill_tile_rows = {}
+
+    def record_compact_prefill(self, kind, rows):
+        """Observe actual operations without synchronizing CUDA or retaining tensors."""
+        self._ensure_prefill_counters()
+        rows = int(rows)
+        count = self._prefill_counters[kind]
+        count["calls"] += 1
+        count["rows"] += rows
+        if kind == "ffn_tile":
+            key = str(rows)
+            self._prefill_tile_rows[key] = self._prefill_tile_rows.get(key, 0) + 1
+
+    def prefill_execution_stats(self):
+        self._ensure_prefill_counters()
+        return {
+            "memory_policy": getattr(self, "_prefill_memory_policy", "auto"),
+            "counters": {
+                kind: dict(values) for kind, values in self._prefill_counters.items()
+            },
+            "ffn_tile_row_histogram": dict(self._prefill_tile_rows),
+            "scope": "cumulative_actual_compact_calls_subtract_before_from_after",
+        }
 
     def _stash_qcompute(self, state: QcFuseRequestState) -> None:
         session_id = state.query_session_id

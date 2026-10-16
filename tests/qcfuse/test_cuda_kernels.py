@@ -535,8 +535,12 @@ def test_gpu_ffn_row_tiles_keep_all_rows_and_native_output(batch):
     expected = _compact_qwen_mlp_forward(mlp, source.clone())
     rows_seen.clear()
     work = source.clone()
-    actual = _compact_qwen_mlp_forward(mlp, work, projection_tile_tokens=8192)
+    observed_tiles = []
+    actual = _compact_qwen_mlp_forward(
+        mlp, work, projection_tile_tokens=8192, on_projection_tile=observed_tiles.append
+    )
     assert actual is work and sum(rows_seen) == tokens
+    assert observed_tiles == rows_seen
     assert max(rows_seen) <= 8192 and min(rows_seen) >= 4096
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

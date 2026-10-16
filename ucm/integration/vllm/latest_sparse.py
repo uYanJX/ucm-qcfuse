@@ -54,7 +54,9 @@ def _compact_silu_and_mul(gate_up, operation, tile_tokens=512):
     return flat[: tokens * intermediate].view(tokens, intermediate)
 
 
-def _compact_qwen_mlp_forward(mlp, hidden_states, projection_tile_tokens=0):
+def _compact_qwen_mlp_forward(
+    mlp, hidden_states, projection_tile_tokens=0, on_projection_tile=None
+):
     """Reuse BF16 FFN buffers, optionally bounding projection rows.
 
     Row tiling is an opt-in experiment. Balance the rows so an uneven end
@@ -72,15 +74,22 @@ def _compact_qwen_mlp_forward(mlp, hidden_states, projection_tile_tokens=0):
         parts = (tokens + projection_tile_tokens - 1) // projection_tile_tokens
         rows = (tokens + parts - 1) // parts
         for start in range(0, tokens, rows):
-            _compact_qwen_mlp_forward(mlp, hidden_states[start : start + rows])
+            _compact_qwen_mlp_forward(
+                mlp,
+                hidden_states[start : start + rows],
+                on_projection_tile=on_projection_tile,
+            )
         return hidden_states
     gate_up, _ = mlp.gate_up_proj(hidden_states)
     activation = _compact_silu_and_mul(gate_up, mlp.act_fn.op)
     # Input projection has consumed hidden_states. Native BF16 F.linear and
     # its out overload use the same matrix dimensions for this projection.
-    return torch.ops.aten.linear.out(
+    result = torch.ops.aten.linear.out(
         activation, mlp.down_proj.weight, None, out=hidden_states
     )
+    if on_projection_tile is not None:
+        on_projection_tile(tokens)
+    return result
 
 
 def _can_compact_qwen_mlp(mlp, hidden_states, residual):
@@ -162,6 +171,9 @@ def install_vllm_latest_sparse_hooks() -> None:
                 # attention. Q/K norms create their own storage; retain only
                 # an exact V copy while loading GPU-resident cached layers.
                 v = v.clone()
+                record = getattr(sparse, "record_compact_prefill", None)
+                if callable(record):
+                    record("qkv_values", v.shape[0])
             q = self.q_norm(q.view(*q.shape[:-1], -1, self.head_dim)).view(q.shape)
             k = self.k_norm(k.view(*k.shape[:-1], -1, self.head_dim)).view(k.shape)
             del qkv
@@ -207,9 +219,17 @@ def install_vllm_latest_sparse_hooks() -> None:
                 and compact_values()
                 and _can_compact_qwen_mlp(self.mlp, hidden_states, residual)
             ):
-                hidden_states = _compact_qwen_mlp_forward(
-                    self.mlp, hidden_states, projection_tile_tokens
+                record = getattr(sparse, "record_compact_prefill", None)
+                tile_observer = (
+                    (lambda rows: record("ffn_tile", rows))
+                    if callable(record)
+                    else None
                 )
+                hidden_states = _compact_qwen_mlp_forward(
+                    self.mlp, hidden_states, projection_tile_tokens, tile_observer
+                )
+                if callable(record):
+                    record("ffn_layer", hidden_states.shape[0])
             else:
                 hidden_states = self.mlp(hidden_states)
             hidden_states, residual = maybe_execute_sparse_ffn_finished(

@@ -151,12 +151,17 @@ def test_rejects_chunked_prefill():
 
 @pytest.mark.parametrize("storage", ["gpu", "cpu", "ssd"])
 @pytest.mark.parametrize("phase", list(BlendStyle))
-def test_projection_compaction_is_limited_to_gpu_blend(storage, phase):
+@pytest.mark.parametrize("policy", ["auto", "compact"])
+def test_projection_compaction_policy_respects_storage_and_phase(
+    storage, phase, policy
+):
     fuser = object.__new__(QcFuse)
     fuser._store = SimpleNamespace(storage_mode=storage)
     fuser._step = SimpleNamespace(active=True, phase=phase)
+    fuser._prefill_memory_policy = policy
     assert fuser.compact_projection_values() == (
-        storage == "gpu" and phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH)
+        (policy == "compact" or storage == "gpu")
+        and phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH)
     )
     fuser._step.active = False
     assert not fuser.compact_projection_values()

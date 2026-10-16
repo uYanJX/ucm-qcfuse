@@ -159,6 +159,18 @@ receipts record the configured tile budget separately.
 
 ## Position-based attention experiment
 
+`QCFUSE_PREFILL_MEMORY_POLICY=auto` preserves residency-based memory handling:
+GPU-resident sparse prefill copies V out of its fused projection and uses the
+guarded compact MLP implementation; CPU/SSD residency keeps the original path.
+Use `compact` to request the same compact prefill policy for every cache tier.
+It applies only to DO_BLEND/FINISH, with the existing MLP safety guards.
+`QCFUSE_GPU_FFN_TILE_TOKENS` then bounds the compact MLP projection rows on
+each tier. QCOMPUTE, decode, selection, positions and KV format are unchanged.
+Benchmark snapshots expose actual QKV copies, compact MLP layers/tiles, row
+totals and a tile-size histogram under `prefill_execution`. Compare snapshot
+deltas to verify matching computation before attributing latency to loading;
+matching configuration values alone does not establish matching execution.
+
 `QCFUSE_REUSE_ATTN_METADATA=1` optionally reuses the native attention kernel's
 integer query/KV lengths and offsets within one scheduler step. The default
 is `0`. Compaction and critical-layer length changes select separate layouts;

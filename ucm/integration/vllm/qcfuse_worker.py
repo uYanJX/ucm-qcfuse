@@ -22,6 +22,9 @@ class QcFuseWorkerExtension:
             attention_stats = getattr(sparse, "attention_backend_stats", None)
             if callable(attention_stats):
                 result["attention_backend"] = attention_stats()
+            prefill_stats = getattr(sparse, "prefill_execution_stats", None)
+            if callable(prefill_stats):
+                result["prefill_execution"] = prefill_stats()
             take_token_work = getattr(sparse, "take_token_work", None)
             if callable(take_token_work):
                 rows = take_token_work()
