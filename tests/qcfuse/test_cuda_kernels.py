@@ -508,6 +508,68 @@ def test_native_vllm_rope_reuse_preserves_key_bits_for_mixed_lengths():
 
 
 @pytest.mark.parametrize("mode", ["ssd", "cpu", "gpu"])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_store_reports_exact_h2d_payload_across_reused_request_pools(
+    tmp_path, monkeypatch, mode, batch
+):
+    from ucm.store.qcfuse import transfer, packed_format as pf
+    from ucm.store.qcfuse.qcfuse_store import QcFusePrefetchTask, UcmQcFuseStore
+
+    monkeypatch.setenv("QCFUSE_IO_GROUP_LAYERS", "2")
+    monkeypatch.setenv("QCFUSE_TRANSFER_TIMING", "0")
+    key = torch.full((257, 1, 32), 17, dtype=torch.bfloat16)
+    value = torch.full_like(key, 23)
+    path = tmp_path / "kv_packed.bin"
+    pf.save_packed_kv(str(tmp_path), {i: (key + i, value) for i in range(2)}, 2)
+    meta = pf.load_packed_meta(str(tmp_path))
+    store = UcmQcFuseStore({"storage_mode": mode})
+    payload_per_layer = (key.numel() + value.numel()) * key.element_size()
+    operations = [
+        (kind, "", layer, str(tmp_path))
+        for kind, layer in (("query", 0), ("chunk", 0), ("chunk", 1))
+    ]
+    if mode != "ssd":
+        transfer.preload_resident_file(str(path), mode)
+    expected = 0
+    try:
+        for reuse in range(2):
+            for item in range(batch):
+                request_id = f"payload-{reuse}-{item}"
+
+                def load(operation, request):
+                    kind, _, layer, directory = operation
+                    return transfer.load_packed_layer(
+                        directory,
+                        meta,
+                        layer,
+                        "cuda:0",
+                        kind=f"request:{request}:{kind}",
+                        wait=False,
+                    )
+
+                task = QcFusePrefetchTask(request_id, operations, load, depth=2)
+                store._tasks[request_id] = task
+                for operation in operations:
+                    actual = transfer.wait_on_current_stream(task.take(operation))
+                    assert torch.equal(actual[0].cpu(), key + operation[2])
+                    assert torch.equal(actual[1].cpu(), value)
+                    actual[0].fill_(-99)
+                store.finish_request(request_id)
+                if mode != "gpu":
+                    expected += len(operations) * payload_per_layer
+                assert store.metrics()["h2d_bytes"] == expected
+                store.finish_request(request_id)
+                assert store.metrics()["h2d_bytes"] == expected
+                assert not any(
+                    kind.startswith(f"request:{request_id}:")
+                    for kind, _ in transfer._POOLS
+                )
+    finally:
+        torch.cuda.synchronize()
+        store.close()
+
+
+@pytest.mark.parametrize("mode", ["ssd", "cpu", "gpu"])
 def test_actual_cache_load_is_ready_on_another_thread_stream(tmp_path, mode):
     from concurrent.futures import ThreadPoolExecutor
     from ucm.store.qcfuse import transfer, packed_format as pf

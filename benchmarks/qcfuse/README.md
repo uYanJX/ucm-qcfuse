@@ -101,3 +101,7 @@ are cumulative: subtract before from after. `cuda_wait_seconds` measures host
 waiting for a staging-slot completion event; it is not exclusive GPU stall
 time. `cuda_copy_seconds` is available only when CUDA-event timing is enabled;
 a disabled-event zero must not be interpreted as zero transfer work.
+`h2d_bytes` counts actual key/value payload copied by completed requests,
+including CPU resident loads; grouped file-read padding is excluded. GPU
+resident copies do not add H2D bytes. Host enqueue time and overlapped CUDA
+copy duration are separate measurements, neither an exclusive TTFT cost.

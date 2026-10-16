@@ -40,6 +40,7 @@ class QcFuseTransferMetrics:
     resident_cpu_direct_layers: float = 0.0
     pinned_allocation_fallbacks: float = 0.0
     h2d_enqueue_seconds: float = 0.0
+    h2d_bytes: float = 0.0
     cuda_wait_seconds: float = 0.0
     cuda_copy_seconds: float = 0.0
     max_ring_depth: float = 0.0
@@ -585,6 +586,7 @@ class UcmQcFuseStore(UcmKVStoreBaseV1):
             self._metrics.h2d_enqueue_seconds += transfer_metrics.get(
                 "h2d_enqueue_seconds", 0.0
             )
+            self._metrics.h2d_bytes += transfer_metrics.get("h2d_bytes", 0.0)
             self._metrics.cuda_wait_seconds += transfer_metrics.get(
                 "cuda_wait_seconds", 0.0
             )
@@ -615,6 +617,7 @@ class UcmQcFuseStore(UcmKVStoreBaseV1):
             "resident_cpu_direct_layers": self._metrics.resident_cpu_direct_layers,
             "pinned_allocation_fallbacks": self._metrics.pinned_allocation_fallbacks,
             "h2d_enqueue_seconds": self._metrics.h2d_enqueue_seconds,
+            "h2d_bytes": self._metrics.h2d_bytes,
             "cuda_wait_seconds": self._metrics.cuda_wait_seconds,
             "cuda_copy_seconds": self._metrics.cuda_copy_seconds,
             "ring_depth": self._metrics.max_ring_depth,
