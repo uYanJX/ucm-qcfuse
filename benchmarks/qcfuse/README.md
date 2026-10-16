@@ -35,6 +35,17 @@ with `--storage cpu` or `--storage gpu`; `--ssd-cache-state cold` requests a
 filesystem cold-cache control. The model window is an explicit protocol
 parameter, not a guarantee that every input or resident cache fits a GPU.
 
+On Linux, add `--verify-cold-residency` with `--baseline ours --storage ssd
+--ssd-cache-state cold` to record each owned KV file's page residency after
+fsync and per-file eviction advice, immediately before online execution.
+The read-only check does not read payload contents, and its duration is
+recorded outside TTFT. Inspect `cache_state_actions[].residency_before_online`:
+only `all_payload_pages_observed_nonresident=true` establishes an observed
+cold snapshot. Eviction advice alone does not establish this, and a snapshot
+does not identify the backing storage or guarantee later pages stay cold.
+Keep the remaining resident-page counts if advice does not fully evict them;
+do not label that observation a fully cold SSD run.
+
 The runner keeps oversized sources as unavailable entries, checks immutable
 manifest identity and removes its uniquely owned cache root after worker
 shutdown. Keep result JSON, generated predictions and manifests outside Git.

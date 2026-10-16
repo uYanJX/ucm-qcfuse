@@ -5,7 +5,8 @@ import time
 from pathlib import Path
 
 
-def request_cold_cache(root, directories):
+def request_cold_cache(root, directories, *, verify_residency=False):
+    directories = list(directories)
     root = Path(root).resolve()
     if not (root / ".qcfuse_cell_owner").is_file():
         raise ValueError("Cold-cache request needs a cell ownership marker")
@@ -31,10 +32,21 @@ def request_cold_cache(root, directories):
             advised_bytes += path.stat().st_size
         finally:
             os.close(fd)
-    return {
+    result = {
         "files": len(paths),
         "advised_bytes": advised_bytes,
         "seconds": time.perf_counter() - started,
         "eviction_is_advisory": True,
         "method": "fsync_then_per_file_POSIX_FADV_DONTNEED",
     }
+    if verify_residency:
+        from cache_residency import inspect_owned_cache
+
+        started = time.perf_counter()
+        snapshot = inspect_owned_cache(root, directories)
+        assert len(snapshot["files"]) == len(paths)
+        assert snapshot["file_bytes"] == advised_bytes
+        result["residency_before_online"] = snapshot
+        result["residency_check_seconds"] = time.perf_counter() - started
+        result["residency_check_excluded_from_online_ttft"] = True
+    return result
