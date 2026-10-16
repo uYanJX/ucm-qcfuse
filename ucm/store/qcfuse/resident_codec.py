@@ -77,6 +77,11 @@ class CompressedResidentReader:
         else:
             raise ValueError("GPU compression requires a validated packed KV file")
         stream = torch.cuda.current_stream(self.device)
+        # Preload is outside online timing. nvCOMP allocates CUDA workspace
+        # independently of Torch, so idle blocks left by the previous request
+        # or offline prefill must be returned before constructing the encoder.
+        stream.synchronize()
+        torch.cuda.empty_cache()
         encoder = _codec(self.device, stream)
         configs = {}
         nvcomp = _nvcomp_module()

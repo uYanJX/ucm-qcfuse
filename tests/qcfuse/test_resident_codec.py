@@ -282,6 +282,45 @@ def test_cuda_compressed_residency_preserves_all_bf16_patterns(tmp_path):
 
 
 @cuda
+def test_cuda_compressed_preload_reclaims_torch_cache_before_foreign_codec(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("nvidia.nvcomp")
+    from ucm.store.qcfuse import resident_codec
+
+    raw = torch.arange(2048, dtype=torch.int32).to(torch.bfloat16).reshape(256, 1, 8)
+    pf.save_packed_kv(str(tmp_path), {0: (raw, -raw)}, 1)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    unused = torch.empty(512 * 1024**2, dtype=torch.uint8, device="cuda")
+    del unused
+    assert torch.cuda.memory_reserved() - torch.cuda.memory_allocated() >= 512 * 1024**2
+    original = resident_codec._codec
+    observed = []
+
+    def foreign_allocator(device, stream):
+        if not observed:
+            reclaimable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            observed.append(reclaimable)
+            assert (
+                reclaimable < 64 * 1024**2
+            ), "Unused Torch cache must be returned before a foreign CUDA allocator"
+        return original(device, stream)
+
+    monkeypatch.setattr(resident_codec, "_codec", foreign_allocator)
+    transfer.prepare_resident_batch(
+        None, [str(tmp_path / "kv_packed.bin")], "gpu", gpu_codec="ans_f16_bits"
+    )
+    assert observed
+    meta = pf.load_packed_meta(str(tmp_path))
+    actual = transfer.load_packed_layer(
+        str(tmp_path), meta, 0, "cuda:0", kind="codec_test"
+    )
+    for value, expected in zip(actual, (raw, -raw)):
+        assert torch.equal(value.cpu().view(torch.uint8), expected.view(torch.uint8))
+
+
+@cuda
 def test_cuda_partial_compressed_preload_can_retry(tmp_path, monkeypatch):
     pytest.importorskip("nvidia.nvcomp")
     source, query, _, _ = pair(tmp_path)
