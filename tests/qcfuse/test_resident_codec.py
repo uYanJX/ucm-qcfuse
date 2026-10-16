@@ -1,12 +1,60 @@
 import builtins
+import io
 import json
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
 
 from ucm.store.qcfuse import packed_format as pf, transfer
-from ucm.store.qcfuse.resident_codec import QueryAliasReader, validate_query_alias
+from ucm.store.qcfuse.resident_codec import (
+    QueryAliasReader,
+    _read_payload_into,
+    validate_query_alias,
+)
+
+
+def test_preload_input_reuse_reads_exact_bytes_and_keeps_unused_tail(tmp_path):
+    payload = bytes(range(256)) * 3
+    path = tmp_path / "input.bin"
+    path.write_bytes(payload)
+    host = torch.full((137,), 255, dtype=torch.uint8)
+    view = host.numpy()
+    with path.open("rb", buffering=0) as source:
+        for offset, count in ((3, 137), (141, 29), (511, 129)):
+            host.fill_(255)
+            _read_payload_into(source, offset, view[:count])
+            assert bytes(view[:count]) == payload[offset : offset + count]
+            assert bool((host[count:] == 255).all())
+
+
+def test_preload_input_short_reads_and_eof():
+    class ShortReader(io.BytesIO):
+        def readinto(self, target):
+            return super().readinto(target[:3])
+
+    source = ShortReader(bytes(range(17)))
+    target = bytearray(11)
+    _read_payload_into(source, 4, target)
+    assert target == bytes(range(4, 15))
+    incomplete = bytearray(8)
+    with pytest.raises(EOFError, match="Incomplete lossless GPU preload") as retained:
+        _read_payload_into(source, 10, incomplete)
+    assert retained.value.__traceback__ is not None
+    incomplete.extend(b"released")  # No exported memoryview survives the error.
+
+
+def test_preload_input_seek_error_releases_destination_reference():
+    source = io.BytesIO(b"closed")
+    source.close()
+    view = torch.empty(8, dtype=torch.uint8).numpy()
+    reference = weakref.ref(view)
+    with pytest.raises(ValueError, match="closed") as retained:
+        _read_payload_into(source, 0, view)
+    assert retained.value.__traceback__ is not None
+    del view
+    assert reference() is None
 
 
 @pytest.fixture(autouse=True)
