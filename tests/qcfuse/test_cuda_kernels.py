@@ -12,6 +12,80 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
+def test_tma_native_dispatch_cuda_preserves_bits_positions_and_reuse(batch):
+    from types import SimpleNamespace
+    from ucm.sparse.qcfuse.batch import cumulative_starts
+    from ucm.sparse.qcfuse.blend_info import BlendStyle
+    from ucm.sparse.qcfuse.qcfuse import QcFuse
+    from ucm.sparse.qcfuse.ragged_attention import ragged_positions_attention_fwd
+    from triton.runtime import _allocation
+
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("Descriptor attention requires Hopper")
+    torch.manual_seed(1816 + batch)
+    lengths = [5, 99, 139, 211][:batch]
+    keys = [11, 193, 277, 419][:batch]
+    query = torch.randn(sum(lengths) * 2, 64, 128, device="cuda", dtype=torch.bfloat16)[
+        ::2
+    ]
+    key = torch.randn(sum(keys) * 2, 8, 128, device="cuda", dtype=torch.bfloat16)[::2]
+    value = torch.randn_like(key)
+    originals = [t.clone() for t in (query, key, value)]
+    output = torch.empty_like(query)
+    fuser = object.__new__(QcFuse)
+    fuser._attention_backend = "tma"
+    fuser._attention_backend_counts = {"native": 0, "flex": 0}
+    fuser._flex_key_block = 64
+    fuser._step = SimpleNamespace(phase=BlendStyle.DO_BLEND)
+    layer = SimpleNamespace(impl=SimpleNamespace(sliding_window=(-1, -1)))
+    consumer = torch.cuda.Stream()
+    previous_allocator = _allocation._allocator.get()
+    for reuse in range(2):
+        positions = torch.cat(
+            [
+                torch.arange(n - length, n, dtype=torch.int32, device="cuda").flip(0)
+                for length, n in zip(lengths, keys)
+            ]
+        )
+        if reuse:
+            positions = positions.flip(0).clone()
+            # Keep each request's positions within its own full KV range.
+            offset = 0
+            for length, n in zip(lengths, keys):
+                positions[offset : offset + length].remainder_(n)
+                offset += length
+        prepared = SimpleNamespace(q_lens=lengths, kv_lens=keys, q_positions=positions)
+        expected = torch.empty_like(query)
+        metadata = (
+            cumulative_starts(lengths, query.device),
+            torch.tensor(lengths, dtype=torch.int32, device=query.device),
+            cumulative_starts(keys, query.device),
+            torch.tensor(keys, dtype=torch.int32, device=query.device),
+        )
+        ragged_positions_attention_fwd(
+            query, key, value, expected, *metadata, positions, max(lengths)
+        )
+        consumer.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(consumer):
+            fuser._run_sparse_attention(query, key, value, output, layer, prepared)
+        assert _allocation._allocator.get() is previous_allocator
+        consumer.synchronize()
+        assert torch.equal(expected.view(torch.int16), output.view(torch.int16))
+        assert all(
+            torch.equal(old, new) for old, new in zip(originals, (query, key, value))
+        )
+    fuser._step.phase = BlendStyle.QCOMPUTE
+    fuser._run_sparse_attention(query, key, value, output, layer, prepared)
+    torch.cuda.synchronize()
+    assert torch.equal(expected.view(torch.int16), output.view(torch.int16))
+    assert fuser.attention_backend_stats()["layer_calls"] == {
+        "native": 1,
+        "flex": 0,
+        "tma": 2,
+    }
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
 def test_attention_layout_cuda_reuse_preserves_ragged_output(batch):
     from ucm.sparse.qcfuse.batch import QcFuseStepBatch, cumulative_starts
     from ucm.sparse.qcfuse.ragged_attention import ragged_positions_attention_fwd

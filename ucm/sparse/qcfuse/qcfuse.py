@@ -70,12 +70,13 @@ class QcFuse(UcmSparseBase):
         self._attention_backend = os.environ.get(
             "QCFUSE_GPU_ATTENTION_BACKEND", "native"
         )
-        if self._attention_backend not in ("native", "flex"):
-            raise ValueError("QCFUSE_GPU_ATTENTION_BACKEND must be native or flex")
+        if self._attention_backend not in ("native", "flex", "tma"):
+            raise ValueError("QCFUSE_GPU_ATTENTION_BACKEND must be native, flex or tma")
         self._flex_key_block = int(os.environ.get("QCFUSE_FLEX_KEY_BLOCK", "64"))
         if self._attention_backend == "flex" and self._flex_key_block not in (64, 128):
             raise ValueError("QCFUSE_FLEX_KEY_BLOCK must be 64 or 128")
         self._attention_backend_counts = {"native": 0, "flex": 0}
+        self._tma_fallback_counts = {}
         reuse_metadata = os.environ.get("QCFUSE_REUSE_ATTN_METADATA", "0")
         if reuse_metadata not in ("0", "1"):
             raise ValueError("QCFUSE_REUSE_ATTN_METADATA must be 0 or 1")
@@ -88,6 +89,7 @@ class QcFuse(UcmSparseBase):
             "configured": self._attention_backend,
             "flex_key_block": self._flex_key_block,
             "layer_calls": dict(self._attention_backend_counts),
+            "tma_fallbacks": dict(getattr(self, "_tma_fallback_counts", {})),
             "metadata_reuse": {
                 "configured": getattr(self, "_reuse_attention_metadata", False),
                 "layout_builds": getattr(self, "_attention_metadata_builds", 0),
@@ -514,8 +516,6 @@ class QcFuse(UcmSparseBase):
             )
             self._attention_backend_counts["flex"] += 1
             return
-        if hasattr(self, "_attention_backend_counts"):
-            self._attention_backend_counts["native"] += 1
         if getattr(self, "_reuse_attention_metadata", False):
             builds, hits = (
                 self._step.attention_layout_builds,
@@ -536,6 +536,38 @@ class QcFuse(UcmSparseBase):
             self._attention_metadata_builds = (
                 getattr(self, "_attention_metadata_builds", 0) + 1
             )
+        if getattr(self, "_attention_backend", "native") == "tma":
+            reason = "phase_keeps_original_kernel"
+            if self._step.phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH):
+                from ucm.sparse.qcfuse.tma_attention import try_tma_positions_attention
+
+                reason = try_tma_positions_attention(
+                    query,
+                    key,
+                    value,
+                    output,
+                    q_starts,
+                    q_lens,
+                    kv_starts,
+                    kv_lens,
+                    prepared.q_positions,
+                    prepared.q_lens,
+                    prepared.kv_lens,
+                    scale,
+                    sliding_window=sliding_window,
+                    logit_cap=logit_cap,
+                )
+            if reason is None:
+                counts = self._attention_backend_counts
+                counts["tma"] = counts.get("tma", 0) + 1
+                return
+            if not hasattr(self, "_tma_fallback_counts"):
+                self._tma_fallback_counts = {}
+            self._tma_fallback_counts[reason] = (
+                self._tma_fallback_counts.get(reason, 0) + 1
+            )
+        if hasattr(self, "_attention_backend_counts"):
+            self._attention_backend_counts["native"] += 1
         ragged_positions_attention_fwd(
             query,
             key,
