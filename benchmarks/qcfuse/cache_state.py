@@ -5,6 +5,21 @@ import time
 from pathlib import Path
 
 
+def observe_cache_residency(root, directories):
+    """Observe requested warm state without preparing or reading KV payloads."""
+    from cache_residency import inspect_owned_cache
+
+    started = time.perf_counter()
+    snapshot = inspect_owned_cache(root, directories)
+    return {
+        "method": "mincore_without_cache_preparation",
+        "residency_before_online": snapshot,
+        "residency_check_seconds": time.perf_counter() - started,
+        "residency_check_excluded_from_online_ttft": True,
+        "cache_preparation_performed": False,
+    }
+
+
 def request_cold_cache(root, directories, *, verify_residency=False):
     directories = list(directories)
     root = Path(root).resolve()

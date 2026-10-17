@@ -46,6 +46,13 @@ does not identify the backing storage or guarantee later pages stay cold.
 Keep the remaining resident-page counts if advice does not fully evict them;
 do not label that observation a fully cold SSD run.
 
+Use `--verify-ssd-residency` to record the same snapshot for either warm or
+cold SSD requests. Warm mode only observes residency: it does not read,
+preload or warm KV payloads. A warm observation qualifies as fully resident
+only when `resident_pages == pages`; retain partial residency as observed.
+In cold mode the snapshot follows the existing eviction advice. Both options
+are disabled by default, and neither verifies the backing storage medium.
+
 The runner keeps oversized sources as unavailable entries, checks immutable
 manifest identity and removes its uniquely owned cache root after worker
 shutdown. Keep result JSON, generated predictions and manifests outside Git.

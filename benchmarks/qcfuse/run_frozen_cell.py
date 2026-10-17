@@ -27,7 +27,7 @@ from evidence import (
     index_token_audit,
 )
 from utils import load_dataset
-from cache_state import request_cold_cache
+from cache_state import observe_cache_residency, request_cold_cache
 from worker_lifecycle import stop_owned_workers
 
 
@@ -136,6 +136,11 @@ def main():
         action="store_true",
         help="Record a read-only Linux page-cache snapshot after cold advice, before online timing",
     )
+    parser.add_argument(
+        "--verify-ssd-residency",
+        action="store_true",
+        help="Record read-only Linux page residency before each timed warm/cold SSD request",
+    )
     parser.add_argument("--io-group-layers", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=10)
@@ -158,6 +163,8 @@ def main():
         or args.ssd_cache_state != "cold"
     ):
         raise ValueError("Cold residency verification requires ours/ssd/cold")
+    if args.verify_ssd_residency and (args.baseline != "ours" or args.storage != "ssd"):
+        raise ValueError("SSD residency verification requires ours/ssd")
     # This is a total scheduler budget, not a per-request budget.
     args.max_num_batched_tokens = resolve_prefill_budget(
         args.max_model_len, args.max_num_batched_tokens
@@ -446,7 +453,22 @@ def main():
                                     root,
                                     [sample.sample_dir_chunk for sample in samples]
                                     + [sample.sample_dir_query for sample in samples],
-                                    verify_residency=args.verify_cold_residency,
+                                    verify_residency=(
+                                        args.verify_cold_residency
+                                        or args.verify_ssd_residency
+                                    ),
+                                )
+                            )
+                        elif (
+                            args.baseline == "ours"
+                            and args.storage == "ssd"
+                            and args.verify_ssd_residency
+                        ):
+                            result["cache_state_actions"].append(
+                                observe_cache_residency(
+                                    root,
+                                    [sample.sample_dir_chunk for sample in samples]
+                                    + [sample.sample_dir_query for sample in samples],
                                 )
                             )
                         part = engine.phase2_online(

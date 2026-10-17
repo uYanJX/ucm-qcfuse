@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "benchmarks/qcfuse"))
-from cache_state import request_cold_cache
+from cache_state import observe_cache_residency, request_cold_cache
 from cache_residency import file_residency, inspect_owned_cache
 
 
@@ -122,3 +122,39 @@ def test_residency_empty_payload_and_chunk_validation(tmp_path):
     for chunk in (0, 1, os.sysconf("SC_PAGESIZE") + 1):
         with pytest.raises(ValueError, match="whole pages"):
             file_residency(empty, chunk_bytes=chunk)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="mincore requires Linux")
+def test_warm_state_observation_does_not_prepare_or_read_payload(tmp_path, monkeypatch):
+    root = tmp_path / "cell"
+    directory = root / "batch"
+    directory.mkdir(parents=True)
+    (root / ".qcfuse_cell_owner").write_text("our result")
+    path = directory / "kv.bin"
+    payload = bytes(range(256)) * 8192 + b"partial page"
+    path.write_bytes(payload)
+    warm = observe_cache_residency(root, [directory])
+    assert (
+        warm["residency_before_online"]["resident_pages"]
+        == warm["residency_before_online"]["pages"]
+    )
+    cold = request_cold_cache(root, [directory], verify_residency=True)[
+        "residency_before_online"
+    ]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Observation must not advise, read or prepare payload")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "posix_fadvise", forbidden)
+        patch.setattr(os, "read", forbidden)
+        patch.setattr(Path, "read_bytes", forbidden)
+        observed = observe_cache_residency(root, [directory])
+    snapshot = observed["residency_before_online"]
+    assert snapshot["resident_pages"] == cold["resident_pages"]
+    assert snapshot["file_bytes"] == len(payload)
+    assert observed["method"] == "mincore_without_cache_preparation"
+    assert observed["cache_preparation_performed"] is False
+    assert observed["residency_check_excluded_from_online_ttft"] is True
+    assert not snapshot["payload_contents_read"] and not snapshot["files_changed"]
+    assert path.read_bytes() == payload
