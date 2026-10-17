@@ -89,6 +89,7 @@ def try_tma_positions_attention(
     sliding_window=-1,
     logit_cap=0.0,
     automatic=False,
+    execution_info=None,
 ):
     """Return None after a launch, otherwise the reason to use native attention.
 
@@ -128,7 +129,7 @@ def try_tma_positions_attention(
     token = allocator.set(allocate)
     try:
         with torch.cuda.device(q.device):
-            position_attention_tma[
+            compiled = position_attention_tma[
                 (len(q_lengths), 64, triton.cdiv(max(q_lengths), 128))
             ](
                 q,
@@ -156,6 +157,15 @@ def try_tma_positions_attention(
                 num_stages=2,
                 maxnreg=128,
             )
+            if execution_info is not None:
+                execution_info.update(
+                    num_warps=compiled.metadata.num_warps,
+                    num_stages=compiled.metadata.num_stages,
+                    register_limit=128,
+                    registers_per_thread=compiled.n_regs,
+                    spill_slots_per_thread=compiled.n_spills,
+                    shared_bytes=compiled.metadata.shared,
+                )
     finally:
         allocator.reset(token)
     return None

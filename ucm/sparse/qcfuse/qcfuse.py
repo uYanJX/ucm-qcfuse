@@ -77,6 +77,7 @@ class QcFuse(UcmSparseBase):
             raise ValueError("QCFUSE_FLEX_KEY_BLOCK must be 64 or 128")
         self._attention_backend_counts = {"native": 0, "flex": 0}
         self._tma_fallback_counts = {}
+        self._tma_execution_info = {}
         self._prefill_memory_policy = os.environ.get(
             "QCFUSE_PREFILL_MEMORY_POLICY", "auto"
         )
@@ -95,6 +96,7 @@ class QcFuse(UcmSparseBase):
             "flex_key_block": self._flex_key_block,
             "layer_calls": dict(self._attention_backend_counts),
             "tma_fallbacks": dict(getattr(self, "_tma_fallback_counts", {})),
+            "tma_launch": dict(getattr(self, "_tma_execution_info", {})),
             "metadata_reuse": {
                 "configured": getattr(self, "_reuse_attention_metadata", False),
                 "layout_builds": getattr(self, "_attention_metadata_builds", 0),
@@ -579,6 +581,8 @@ class QcFuse(UcmSparseBase):
             if self._step.phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH):
                 from ucm.sparse.qcfuse.tma_attention import try_tma_positions_attention
 
+                if not hasattr(self, "_tma_execution_info"):
+                    self._tma_execution_info = {}
                 reason = try_tma_positions_attention(
                     query,
                     key,
@@ -595,6 +599,7 @@ class QcFuse(UcmSparseBase):
                     sliding_window=sliding_window,
                     logit_cap=logit_cap,
                     automatic=self._attention_backend == "auto",
+                    execution_info=self._tma_execution_info,
                 )
             if reason is None:
                 counts = self._attention_backend_counts

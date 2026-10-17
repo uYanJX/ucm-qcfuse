@@ -92,6 +92,14 @@ def test_tma_native_dispatch_cuda_preserves_bits_positions_and_reuse(batch, back
     if backend != "native" and not uses_tma:
         reason = "automatic_device_model" if hopper else "device_capability"
         assert stats["tma_fallbacks"][reason] == 2
+    if uses_tma:
+        launch = stats["tma_launch"]
+        assert launch["num_warps"] == 8 and launch["num_stages"] == 2
+        assert launch["register_limit"] == 128
+        assert 0 < launch["registers_per_thread"] <= 128
+        assert launch["spill_slots_per_thread"] >= 0 and launch["shared_bytes"] > 0
+    else:
+        assert stats["tma_launch"] == {}
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
