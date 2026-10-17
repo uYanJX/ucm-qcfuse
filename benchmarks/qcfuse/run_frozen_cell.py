@@ -28,6 +28,7 @@ from evidence import (
 )
 from utils import load_dataset
 from cache_state import observe_cache_residency, request_cold_cache
+from batch_diagnostics import execution_context, hash_owned_payloads
 from worker_lifecycle import stop_owned_workers
 
 
@@ -132,6 +133,17 @@ def main():
         "--decode-cudagraph", choices=("on", "off", "piecewise"), default="off"
     )
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--qcompute-batch-size",
+        type=int,
+        default=None,
+        help="Optional query group size; DO_BLEND/decode keep --batch-size",
+    )
+    parser.add_argument(
+        "--audit-cache-payloads",
+        action="store_true",
+        help="Hash owned KV before resident-cache audit, outside online TTFT",
+    )
     parser.add_argument("--critical-layers", type=int, default=3)
     parser.add_argument("--offline-kv-device", choices=("cpu", "gpu"), default="cpu")
     parser.add_argument("--thinking", choices=("on", "off"), default="off")
@@ -169,6 +181,14 @@ def main():
         help="Instrumented diagnostic; adds per-layer logging overhead",
     )
     args = parser.parse_args()
+    if args.qcompute_batch_size is not None and (
+        args.baseline != "ours" or not 1 <= args.qcompute_batch_size <= args.batch_size
+    ):
+        parser.error("QCOMPUTE grouping requires ours and a size within batch-size")
+    if args.audit_cache_payloads and (
+        args.kind != "audit" or args.baseline != "ours" or args.storage == "ssd"
+    ):
+        parser.error("Payload hashing requires an ours CPU/GPU resident audit")
     if args.verify_cold_residency and (
         args.baseline != "ours"
         or args.storage != "ssd"
@@ -347,7 +367,9 @@ def main():
                 decode_cudagraph_mode=(
                     "piecewise" if args.decode_cudagraph == "piecewise" else "full"
                 ),
+                qcompute_batch_size=args.qcompute_batch_size,
             )
+            result["execution_context"] = execution_context(engine)
             capture_workers = getattr(engine, "worker_process_identities", None)
             if callable(capture_workers):
                 worker_processes = capture_workers()
@@ -436,6 +458,14 @@ def main():
                             "excluded_from_online_ttft": True,
                         }
                     )
+                    if args.audit_cache_payloads:
+                        result["offline_cache_batches"][-1]["payload_audit"] = (
+                            hash_owned_payloads(
+                                root,
+                                [sample.sample_dir_chunk for sample in samples]
+                                + [sample.sample_dir_query for sample in samples],
+                            )
+                        )
                 try:
                     if offset == 0 or args.kind == "timing":
                         warmup = engine.warmup_blend(

@@ -37,6 +37,7 @@ import json
 import os
 import statistics
 import time
+from batch_diagnostics import query_batches
 from evidence import (
     RATIO_SEMANTICS,
     baseline_identity,
@@ -277,7 +278,14 @@ class SSDPipelineEngine(BlendEngineBase):
         gpu_query_alias: bool = False,
         decode_cudagraph: bool = False,
         decode_cudagraph_mode: str = "full",
+        qcompute_batch_size: Optional[int] = None,
     ):
+        if qcompute_batch_size is not None and (
+            not isinstance(qcompute_batch_size, int)
+            or not 1 <= qcompute_batch_size <= batch_size
+        ):
+            raise ValueError("QCOMPUTE batch size must be between 1 and batch_size")
+        self.qcompute_batch_size = qcompute_batch_size
         # The base constructor reads this through _kv_connector_extra_config().
         self.cache_dir = cache_dir
         self.storage_mode = storage_mode
@@ -845,7 +853,7 @@ class SSDPipelineEngine(BlendEngineBase):
             if prepare:
                 prepares.append({"repeat": repeat, **prepare})
             if has_qcompute:
-                self._drain_generate_batch(
+                groups = query_batches(
                     [
                         (
                             sample.query_sep,
@@ -856,8 +864,11 @@ class SSDPipelineEngine(BlendEngineBase):
                             },
                         )
                         for sample in batch
-                    ]
+                    ],
+                    getattr(self, "qcompute_batch_size", None),
                 )
+                for group in groups:
+                    self._drain_generate_batch(group)
             self._drain_generate_batch(
                 [
                     (
@@ -1018,7 +1029,7 @@ class SSDPipelineEngine(BlendEngineBase):
             else:
                 if has_qcompute:
                     q_started = time.perf_counter()
-                    query_outputs = self._timed_generate_batch(
+                    groups = query_batches(
                         [
                             (
                                 sample.query_sep,
@@ -1029,10 +1040,18 @@ class SSDPipelineEngine(BlendEngineBase):
                                 },
                             )
                             for sample in batch
-                        ]
+                        ],
+                        getattr(self, "qcompute_batch_size", None),
                     )
+                    query_outputs = []
+                    for group in groups:
+                        group_outputs = self._timed_generate_batch(group)
+                        if len(group_outputs) != len(group):
+                            raise RuntimeError("QCOMPUTE response count differs")
+                        query_outputs.extend(group_outputs)
                     q_wall = time.perf_counter() - q_started
                 else:
+                    groups = []
                     query_outputs = [{"latency": 0.0} for _sample in batch]
                     q_wall = 0.0
 
@@ -1056,6 +1075,7 @@ class SSDPipelineEngine(BlendEngineBase):
                         "batch": batch_number,
                         "size": len(batch),
                         "qcompute_wall_seconds": q_wall,
+                        "qcompute_group_sizes": [len(group) for group in groups],
                         "do_blend_wall_seconds": blend_wall,
                         "qcompute_output_latency_seconds": [
                             float(item.get("latency", 0.0)) for item in query_outputs

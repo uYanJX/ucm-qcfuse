@@ -57,6 +57,22 @@ The runner keeps oversized sources as unavailable entries, checks immutable
 manifest identity and removes its uniquely owned cache root after worker
 shutdown. Keep result JSON, generated predictions and manifests outside Git.
 
+For a query-scheduling diagnostic, set an explicit
+`VLLM_ENABLE_V1_MULTIPROCESSING=0` for both control and candidate and add
+`--qcompute-batch-size 1` to split only QCOMPUTE. DO_BLEND and decode retain
+`--batch-size`; warmup follows the same query grouping. The default keeps the
+existing query batching. Inspect `execution_context` for the actual EngineCore
+client class and environment, and `parts[].phase_timings[].qcompute_group_sizes`
+for observed query submission sizes. This option does not establish output
+equivalence or accuracy by itself.
+
+Add `--audit-cache-payloads` to an `ours` CPU/GPU resident audit to record owned
+KV file sizes and SHA-256 under `offline_cache_batches[].payload_audit`.
+Hashing reads payloads before online execution and is excluded from TTFT;
+it is rejected for SSD, quality and timing runs to avoid hidden cache warming
+or formal timing overhead. Compare hashes before attributing a result to
+scheduling alone. No KV contents are included in the receipt.
+
 ## Interactive dataset runner
 
 ```bash

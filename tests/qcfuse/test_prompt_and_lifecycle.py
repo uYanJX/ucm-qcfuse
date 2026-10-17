@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import pytest
 
 from ucm.sparse.qcfuse.blend_info import BlendStyle, QcFuseRequestState
 from ucm.sparse.qcfuse.qcfuse import QcFuse
@@ -280,7 +281,8 @@ def test_qcompute_model_loop_stops_at_cache_end_and_restores_native_depth():
     assert model.end_layer == 64
 
 
-def test_pipeline_ttft_includes_qcompute_batch_barrier(monkeypatch):
+@pytest.mark.parametrize("query_group_size", [None, 1, 2])
+def test_pipeline_ttft_includes_qcompute_batch_barrier(monkeypatch, query_group_size):
     import blend_ssd
     from types import SimpleNamespace
 
@@ -288,6 +290,7 @@ def test_pipeline_ttft_includes_qcompute_batch_barrier(monkeypatch):
     engine.method = "attn"
     engine.baseline = "ours"
     engine.batch_size = 2
+    engine.qcompute_batch_size = query_group_size
     engine.tokenizer = SimpleNamespace(
         all_special_ids=[99],
         convert_tokens_to_ids=lambda text: {"<think>": 1, "</think>": 2}[text],
@@ -301,14 +304,19 @@ def test_pipeline_ttft_includes_qcompute_batch_barrier(monkeypatch):
     ]
     engine._prepare_samples = lambda *args: samples
     engine._prepare_resident_batch = lambda batch: None
-    engine._blend_args = lambda *args: {}
+    engine._blend_args = lambda style, *args: {"blend_style": style}
     engine._ssd_args = lambda sample: {}
+    query_outputs = [
+        {"latency": 1.0, "request_id": "q0"},
+        {"latency": 4.0, "request_id": "q1"},
+    ]
     outputs = iter(
-        [
-            [
-                {"latency": 1.0, "request_id": "q0"},
-                {"latency": 4.0, "request_id": "q1"},
-            ],
+        (
+            [query_outputs[:1], query_outputs[1:]]
+            if query_group_size == 1
+            else [query_outputs]
+        )
+        + [
             [
                 {
                     "request_id": f"b{index}",
@@ -341,7 +349,18 @@ def test_pipeline_ttft_includes_qcompute_batch_barrier(monkeypatch):
     assert result["records"][0]["engine_phase_ttft_seconds"] == 1.5
     assert result["do_blend_ttft"] == [0.5, 0.8]
 
-    assert all(request[1]["max_new_tokens"] == 4096 for request in submitted[1])
+    assert len(submitted[-1]) == 2
+    assert all(request[1]["max_new_tokens"] == 4096 for request in submitted[-1])
+    assert [request[2]["blend_style"] for request in submitted[-1]] == [
+        "DO_BLEND_FINISH"
+    ] * 2
+    assert [len(group) for group in submitted[:-1]] == (
+        [1, 1] if query_group_size == 1 else [2]
+    )
+    assert [r["qcompute_request_id"] for r in result["records"]] == ["q0", "q1"]
+    assert result["phase_timings"][0]["qcompute_group_sizes"] == (
+        [1, 1] if query_group_size == 1 else [2]
+    )
 
 
 def _stash():
