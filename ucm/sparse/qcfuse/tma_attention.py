@@ -88,6 +88,7 @@ def try_tma_positions_attention(
     scale,
     sliding_window=-1,
     logit_cap=0.0,
+    automatic=False,
 ):
     """Return None after a launch, otherwise the reason to use native attention.
 
@@ -100,6 +101,8 @@ def try_tma_positions_attention(
     )
     if reason is not None:
         return reason
+    if automatic and "H20" not in torch.cuda.get_device_name(q.device).split():
+        return "automatic_device_model"
     try:
         import triton
         import triton.language as tl

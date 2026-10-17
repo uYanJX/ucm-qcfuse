@@ -28,6 +28,43 @@ def headers():
     ]
 
 
+def test_default_backend_is_auto_without_initializing_cuda(monkeypatch):
+    from ucm.sparse.qcfuse.qcfuse import QcFuse
+
+    monkeypatch.delenv("QCFUSE_GPU_ATTENTION_BACKEND", raising=False)
+    config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cuda"),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    assert QcFuse(config, None).attention_backend_stats()["configured"] == "auto"
+
+
+def test_auto_keeps_unvalidated_hopper_model_native(monkeypatch):
+    from ucm.sparse.qcfuse.tma_attention import try_tma_positions_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "NVIDIA H100")
+    q, k, v, out, positions = headers()
+    assert (
+        try_tma_positions_attention(
+            q,
+            k,
+            v,
+            out,
+            None,
+            None,
+            None,
+            None,
+            positions,
+            [3],
+            [5],
+            128**-0.5,
+            automatic=True,
+        )
+        == "automatic_device_model"
+    )
+
+
 def test_tma_cpu_fallback_never_initializes_device(monkeypatch):
     def unexpected(*args):
         raise AssertionError("CPU fallback must not query a CUDA device")
@@ -80,7 +117,8 @@ def test_tma_unsupported_headers_choose_native(monkeypatch, case, expected):
     assert _unsupported_reason(*args, [3], kv_lengths, window, cap) == expected
 
 
-def test_qcompute_tma_request_keeps_original_native_attention(monkeypatch):
+@pytest.mark.parametrize("backend", ["auto", "tma"])
+def test_qcompute_tma_request_keeps_original_native_attention(monkeypatch, backend):
     from ucm.sparse.qcfuse.blend_info import BlendStyle
     from ucm.sparse.qcfuse.qcfuse import QcFuse
     from ucm.sparse.qcfuse import ragged_attention
@@ -93,7 +131,7 @@ def test_qcompute_tma_request_keeps_original_native_attention(monkeypatch):
 
     monkeypatch.setattr(ragged_attention, "ragged_positions_attention_fwd", native)
     fuser = object.__new__(QcFuse)
-    fuser._attention_backend = "tma"
+    fuser._attention_backend = backend
     fuser._attention_backend_counts = {"native": 0, "flex": 0}
     fuser._flex_key_block = 64
     fuser._step = SimpleNamespace(phase=BlendStyle.QCOMPUTE)
@@ -108,3 +146,33 @@ def test_qcompute_tma_request_keeps_original_native_attention(monkeypatch):
     stats = fuser.attention_backend_stats()
     assert stats["layer_calls"] == {"native": 1, "flex": 0}
     assert stats["tma_fallbacks"] == {"phase_keeps_original_kernel": 1}
+
+
+@pytest.mark.parametrize("backend", ["auto", "tma", "native"])
+def test_blend_unsupported_cpu_keeps_native_output(monkeypatch, backend):
+    from ucm.sparse.qcfuse.blend_info import BlendStyle
+    from ucm.sparse.qcfuse.qcfuse import QcFuse
+    from ucm.sparse.qcfuse import ragged_attention
+
+    monkeypatch.setattr(
+        ragged_attention,
+        "ragged_positions_attention_fwd",
+        lambda q, k, v, out, *args, **kwargs: out.copy_(q),
+    )
+    fuser = object.__new__(QcFuse)
+    fuser._attention_backend = backend
+    fuser._attention_backend_counts = {"native": 0, "flex": 0}
+    fuser._flex_key_block = 64
+    fuser._step = SimpleNamespace(phase=BlendStyle.DO_BLEND)
+    q = torch.randn(3, 64, 128)
+    k = v = torch.randn(5, 8, 128)
+    out = torch.empty_like(q)
+    prepared = SimpleNamespace(
+        q_lens=[3], kv_lens=[5], q_positions=torch.tensor([4, 0, 2])
+    )
+    layer = SimpleNamespace(impl=SimpleNamespace(sliding_window=(-1, -1)))
+    fuser._run_sparse_attention(q, k, v, out, layer, prepared)
+    assert torch.equal(out, q)
+    stats = fuser.attention_backend_stats()
+    assert stats["layer_calls"] == {"native": 1, "flex": 0}
+    assert stats["tma_fallbacks"] == ({} if backend == "native" else {"device": 1})

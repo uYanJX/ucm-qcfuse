@@ -198,15 +198,21 @@ adopting it. `QCFUSE_FLEX_KEY_BLOCK=64` (default) or `128` controls key tiling.
 Worker benchmark snapshots report actual native/flex layer-call counts;
 frozen receipts record the backend and block size.
 
-`QCFUSE_GPU_ATTENTION_BACKEND=tma` is an experimental source implementation
-of descriptor-load attention for Hopper, BF16, 64 query heads, 8 KV heads and
+The default `QCFUSE_GPU_ATTENTION_BACKEND=auto` selects descriptor-load
+attention for NVIDIA H20, BF16, 64 query heads, 8 KV heads and
 head size 128. It applies to DO_BLEND prefill with the original query-position
 causal mask, full cached KV and reference floating-point reduction order.
 QCOMPUTE and decode retain native attention. Other devices, unsupported layouts,
 sliding windows and logit caps fall back to native; worker snapshots expose
-actual TMA calls and fallback reasons. The default remains `native`. Validate
-CUDA batch 1/2/4, repeated reuse, complete-model outputs and frozen quality
-before adopting this option; a requested backend is not proof it executed.
+actual TMA calls and fallback reasons. Set `QCFUSE_GPU_ATTENTION_BACKEND=native`
+to retain the reference kernel explicitly, or `tma` to request the guarded
+descriptor path. Automatic selection uses the same kernel and guards as `tma`;
+it does not change recomputation ratios or attention arithmetic. A requested
+backend is not proof it executed: inspect actual layer-call counts. Explicit
+`tma` retains the opt-in Hopper guard; automatic selection keeps other GPU
+models on native until separately validated. CUDA
+batch 1/2/4, repeated reuse, complete-model outputs and frozen quality remain
+the acceptance requirements for a new deployment shape or runtime.
 
 Audit defaults to one observation. Use `--audit-repeats 2` to verify two
 continuous requests against the same resident source. `--repeats` controls

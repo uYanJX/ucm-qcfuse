@@ -13,7 +13,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
-def test_tma_native_dispatch_cuda_preserves_bits_positions_and_reuse(batch):
+@pytest.mark.parametrize("backend", ["auto", "tma", "native"])
+def test_tma_native_dispatch_cuda_preserves_bits_positions_and_reuse(batch, backend):
     from types import SimpleNamespace
     from ucm.sparse.qcfuse.batch import cumulative_starts
     from ucm.sparse.qcfuse.blend_info import BlendStyle
@@ -21,8 +22,12 @@ def test_tma_native_dispatch_cuda_preserves_bits_positions_and_reuse(batch):
     from ucm.sparse.qcfuse.ragged_attention import ragged_positions_attention_fwd
     from triton.runtime import _allocation
 
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("Descriptor attention requires Hopper")
+    hopper = torch.cuda.get_device_capability()[0] == 9
+    uses_tma = (
+        hopper
+        and backend != "native"
+        and (backend == "tma" or "H20" in torch.cuda.get_device_name().split())
+    )
     torch.manual_seed(1816 + batch)
     lengths = [5, 99, 139, 211][:batch]
     keys = [11, 193, 277, 419][:batch]
@@ -34,7 +39,7 @@ def test_tma_native_dispatch_cuda_preserves_bits_positions_and_reuse(batch):
     originals = [t.clone() for t in (query, key, value)]
     output = torch.empty_like(query)
     fuser = object.__new__(QcFuse)
-    fuser._attention_backend = "tma"
+    fuser._attention_backend = backend
     fuser._attention_backend_counts = {"native": 0, "flex": 0}
     fuser._flex_key_block = 64
     fuser._step = SimpleNamespace(phase=BlendStyle.DO_BLEND)
@@ -79,11 +84,14 @@ def test_tma_native_dispatch_cuda_preserves_bits_positions_and_reuse(batch):
     fuser._run_sparse_attention(query, key, value, output, layer, prepared)
     torch.cuda.synchronize()
     assert torch.equal(expected.view(torch.int16), output.view(torch.int16))
-    assert fuser.attention_backend_stats()["layer_calls"] == {
-        "native": 1,
-        "flex": 0,
-        "tma": 2,
-    }
+    stats = fuser.attention_backend_stats()
+    assert stats["configured"] == backend
+    assert stats["layer_calls"] == (
+        {"native": 1, "flex": 0, "tma": 2} if uses_tma else {"native": 3, "flex": 0}
+    )
+    if backend != "native" and not uses_tma:
+        reason = "automatic_device_model" if hopper else "device_capability"
+        assert stats["tma_fallbacks"][reason] == 2
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])

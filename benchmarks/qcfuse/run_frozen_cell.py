@@ -286,9 +286,7 @@ def main():
                 os.getenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5")
             ),
             "offline_build_workspace": os.getenv("QCFUSE_OFFLINE_BUILD_WORKSPACE"),
-            "gpu_attention_backend": os.getenv(
-                "QCFUSE_GPU_ATTENTION_BACKEND", "native"
-            ),
+            "gpu_attention_backend": os.getenv("QCFUSE_GPU_ATTENTION_BACKEND", "auto"),
             "flex_key_block": int(os.getenv("QCFUSE_FLEX_KEY_BLOCK", "64")),
             "gpu_ffn_projection_tile_tokens": int(
                 os.getenv("QCFUSE_GPU_FFN_TILE_TOKENS", "0")

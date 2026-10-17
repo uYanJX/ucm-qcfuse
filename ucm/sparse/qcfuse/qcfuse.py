@@ -67,11 +67,11 @@ class QcFuse(UcmSparseBase):
         self._qcompute_reuse_hits = 0
         self._qcompute_reuse_misses = 0
         self._completed_token_work = deque(maxlen=256)
-        self._attention_backend = os.environ.get(
-            "QCFUSE_GPU_ATTENTION_BACKEND", "native"
-        )
-        if self._attention_backend not in ("native", "flex", "tma"):
-            raise ValueError("QCFUSE_GPU_ATTENTION_BACKEND must be native, flex or tma")
+        self._attention_backend = os.environ.get("QCFUSE_GPU_ATTENTION_BACKEND", "auto")
+        if self._attention_backend not in ("auto", "native", "flex", "tma"):
+            raise ValueError(
+                "QCFUSE_GPU_ATTENTION_BACKEND must be auto, native, flex or tma"
+            )
         self._flex_key_block = int(os.environ.get("QCFUSE_FLEX_KEY_BLOCK", "64"))
         if self._attention_backend == "flex" and self._flex_key_block not in (64, 128):
             raise ValueError("QCFUSE_FLEX_KEY_BLOCK must be 64 or 128")
@@ -574,7 +574,7 @@ class QcFuse(UcmSparseBase):
             self._attention_metadata_builds = (
                 getattr(self, "_attention_metadata_builds", 0) + 1
             )
-        if getattr(self, "_attention_backend", "native") == "tma":
+        if getattr(self, "_attention_backend", "native") in ("auto", "tma"):
             reason = "phase_keeps_original_kernel"
             if self._step.phase in (BlendStyle.DO_BLEND, BlendStyle.DO_BLEND_FINISH):
                 from ucm.sparse.qcfuse.tma_attention import try_tma_positions_attention
@@ -594,6 +594,7 @@ class QcFuse(UcmSparseBase):
                     scale,
                     sliding_window=sliding_window,
                     logit_cap=logit_cap,
+                    automatic=self._attention_backend == "auto",
                 )
             if reason is None:
                 counts = self._attention_backend_counts
