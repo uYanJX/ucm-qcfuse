@@ -152,8 +152,9 @@ def try_tma_positions_attention(
                 M=128,
                 N=64,
                 SPECIALIZE=False,
-                num_warps=4,
+                num_warps=8,
                 num_stages=2,
+                maxnreg=128,
             )
     finally:
         allocator.reset(token)

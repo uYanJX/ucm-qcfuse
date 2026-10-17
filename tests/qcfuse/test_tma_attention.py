@@ -28,7 +28,7 @@ def headers():
     ]
 
 
-def test_default_backend_is_auto_without_initializing_cuda(monkeypatch):
+def test_default_backend_is_auto_without_device_initialization(monkeypatch):
     from ucm.sparse.qcfuse.qcfuse import QcFuse
 
     monkeypatch.delenv("QCFUSE_GPU_ATTENTION_BACKEND", raising=False)
