@@ -1,4 +1,4 @@
-"""Batch comparisons must preserve the complete fixed timing cohort."""
+"""Batch comparisons must preserve the complete fixed measurement cohort."""
 
 import sys
 from pathlib import Path
@@ -20,6 +20,27 @@ def test_batch_comparison_uses_identical_source_ids():
 def test_invalid_timing_cohort_is_rejected(kind, count):
     with pytest.raises(ValueError, match="available cohort"):
         measurement_rows([0, 1, 2, 3], kind, 1, count)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_fixed_audit_cohort_covers_every_batch_and_preserves_default(batch):
+    rows = [{"source_id": index} for index in range(4)]
+    assert measurement_rows(rows, "audit", batch, audit_samples=4) == rows
+    assert measurement_rows(rows, "audit", batch) == rows[:batch]
+    assert measurement_rows(rows, "timing", batch) == rows[:batch]
+
+
+@pytest.mark.parametrize(
+    "kind,count", [("quality", 4), ("timing", 4), ("audit", 0), ("audit", 5)]
+)
+def test_invalid_audit_cohort_is_rejected(kind, count):
+    with pytest.raises(ValueError, match="available cohort"):
+        measurement_rows([0, 1, 2, 3], kind, 1, audit_samples=count)
+
+
+def test_audit_and_timing_cohorts_cannot_be_combined():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        measurement_rows([0, 1, 2, 3], "audit", 1, 4, 4)
 
 
 def test_cache_workspace_lease_excludes_other_process_then_releases(tmp_path):

@@ -52,8 +52,14 @@ def acquire_cache_workspace(parent):
     return lease, time.perf_counter() - started
 
 
-def measurement_rows(rows, kind, batch_size, timing_samples=None):
-    """Keep a fixed cohort when comparing different concurrent batch sizes."""
+def measurement_rows(rows, kind, batch_size, timing_samples=None, audit_samples=None):
+    """Keep a fixed cohort for timing and instrumented batch comparisons."""
+    if timing_samples is not None and audit_samples is not None:
+        raise ValueError("timing_samples and audit_samples are mutually exclusive")
+    if audit_samples is not None:
+        if kind != "audit" or not 1 <= audit_samples <= len(rows):
+            raise ValueError("audit_samples requires audit and an available cohort")
+        return rows[:audit_samples]
     if timing_samples is not None:
         if kind != "timing" or not 1 <= timing_samples <= len(rows):
             raise ValueError("timing_samples requires timing and an available cohort")
@@ -152,6 +158,12 @@ def main():
         help="Fixed cohort size for timing; independent of concurrent batch size",
     )
     parser.add_argument(
+        "--audit-samples",
+        type=int,
+        default=None,
+        help="Fixed cohort size for audit; independent of concurrent batch size",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Instrumented diagnostic; adds per-layer logging overhead",
@@ -206,7 +218,9 @@ def main():
         "verified_official_dataset",
     ):
         raise ValueError("Frozen source provenance is unverified")
-    rows = measurement_rows(rows, args.kind, args.batch_size, args.timing_samples)
+    rows = measurement_rows(
+        rows, args.kind, args.batch_size, args.timing_samples, args.audit_samples
+    )
     eligible, unavailable = [], []
     for index, row in enumerate(rows):
         sample = manifest["samples"][index]

@@ -108,6 +108,11 @@ cells use no token-log file or CUDA timing events. A bounded worker buffer is
 cleared before the measured batch and drained afterwards through the named
 control RPC; QCOMPUTE and DO_BLEND records are associated by client request ID.
 `--kind audit` additionally records CUDA stream intervals and layer diagnostics.
+For comparisons across batch sizes, use `--audit-samples N --audit-repeats 2`
+to check the same first N frozen sources, then `--kind timing --timing-samples N`
+for measurements without instrumentation. Both cohort options are independent
+of `--batch-size` and cannot be combined. Without a cohort option, audit and
+timing keep their first-batch default; quality visits all frozen sources.
 The ratio remains a document selection budget, rather than a full-model FLOPs
 or retained-KV fraction. Results generated before these observations were
 enabled retain their original fields and are not backfilled with formula data.
