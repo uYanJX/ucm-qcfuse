@@ -6,7 +6,6 @@ include requirements-qcfuse.txt
 graft LICENSES
 graft ucm
 graft kv_semantics
-graft test
 graft tests
 graft examples
 graft benchmarks

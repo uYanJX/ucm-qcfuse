@@ -111,7 +111,7 @@ variants are not reported as CacheBlend or ProphetKV.
 | `ucm/integration/vllm/qcfuse_worker.py` | Residency control, memory attribution and bounded profiling |
 | `benchmarks/qcfuse/` | Dataset preparation, measured runs, queue and result validation |
 | `tests/qcfuse/` | CPU, CUDA, lifecycle and benchmark-contract tests |
-| `ucm/`, `kv_semantics/`, `test/` | UCM Python/native source and upstream tests |
+| `ucm/`, `kv_semantics/` | UCM Python/native source |
 
 For diagnostics, the configured worker extension exposes named RPCs that work
 with the current vLLM serializer:
